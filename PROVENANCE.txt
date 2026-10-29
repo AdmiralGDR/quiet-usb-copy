@@ -1,0 +1,14 @@
+Quiet USB Copy — authorship
+===========================
+Repository : https://github.com/AdmiralGDR/quiet-usb-copy
+Author     : AdmiralGDR <admiralgdr@gmail.com>
+License    : GPL-3.0-or-later
+GPG key    : A3965B86B757ED868F7313CA5D0A1DD21D17A4FD
+             (see KEYS.asc)
+
+AdmiralGDR is the sole author and copyright holder of Quiet USB Copy.
+All commits in this repository are authored, committed and GPG-signed by
+AdmiralGDR <admiralgdr@gmail.com> with the project signing key named above.
+
+Git author and committer dates are self-asserted. Independent time evidence,
+when present, is the OpenTimestamps proof under stamps/.

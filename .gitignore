@@ -1,0 +1,18 @@
+# Editor and OS junk
+.DS_Store
+*~
+*.swp
+.idea/
+.vscode/
+
+# Test scratch (run.sh uses /tmp/quc-tests.*; keep local leftovers out)
+/tmp/
+quc-tests.*/
+
+# Compiled test helpers
+tests/*.o
+tests/*.so
+tests/a.out
+
+# OpenTimestamps upgrade scratch
+*.ots.bak
