@@ -101,11 +101,17 @@ begin_test() {
     PATH=$ORIG_PATH
     unset QUC_FILE_PAUSE
     unset QUC_POST_COPY_DELAY
+    unset QUC_FAKE_VOLUMES
     unset LD_PRELOAD
     export HOME=$WORK/home
     export XDG_STATE_HOME=$WORK/xdg-$current
+    export XDG_RUNTIME_DIR=$WORK/run-$current
     export LC_ALL=C
-    mkdir -p "$HOME" "$XDG_STATE_HOME" "$WORK/t-$current"
+    mkdir -p "$HOME" "$XDG_STATE_HOME" "$XDG_RUNTIME_DIR" "$WORK/t-$current"
+    quc_run_dir=
+    quc_runtime_base=
+    quc_job_dir=
+    quc_stop_requested=0
     cd "$WORK" || return 1
     printf 'RUN %s\n' "$current"
 }
@@ -273,7 +279,13 @@ test_static() {
     if [ "$quc_ec" -ne 0 ]; then
         bad=1
     fi
-    if ! grep -q 'start' "$quc_out"; then
+    if ! grep -q 'start' "$quc_out" || ! grep -q 'doctor' "$quc_out" || ! grep -q 'cleanup' "$quc_out"; then
+        bad=1
+    fi
+    run_quiet "$SH" "$SCRIPT" version
+    if [ "$quc_ec" -ne 0 ] || ! grep -q '^quiet-usb-copy 0.3.0$' "$quc_out" || ! grep -q '^build 20261029.2$' "$quc_out"; then
+        echo "version output"
+        cat "$quc_out" "$quc_err"
         bad=1
     fi
     if [ "$bad" -eq 0 ]; then
@@ -705,6 +717,222 @@ EOF
     esac
     quc_sync_mode=none
 
+    quc_default_job_vars
+    quc_copy_status=SUCCESS
+    quc_verify_status=checksum
+    quc_sync_status=command_ok
+    quc_files_done=3
+    quc_files_total=3
+    quc_profile=gentle
+    quc_source=/mnt/src
+    quc_target=/mnt/dst
+    text=$(quc_print_human)
+    case $text in
+        *'Копирование завершено.'*) ;;
+        *) echo "human success"; bad=1 ;;
+    esac
+    case $text in
+        *'Файлы: 3 из 3'*) ;;
+        *) echo "human files"; bad=1 ;;
+    esac
+    case $text in
+        *'Проверка содержимого: завершена'*) ;;
+        *) echo "human verify"; bad=1 ;;
+    esac
+    case $text in
+        *'Для извлечения'*) ;;
+        *) echo "human eject"; bad=1 ;;
+    esac
+    case $text in
+        *'Режим: бережный'*) ;;
+        *) echo "human gentle"; bad=1 ;;
+    esac
+    case $text in
+        *'можно извлекать'*|*'copy_status='*) echo "human leaked machine or eject permission"; bad=1 ;;
+    esac
+    quc_copy_status=PARTIAL
+    quc_verify_status=none
+    quc_sync_status=unconfirmed
+    quc_error=
+    text=$(quc_print_human)
+    case $text in
+        *'Копирование завершено частично.'*) ;;
+        *) echo "human partial"; bad=1 ;;
+    esac
+    case $text in
+        *'Копирование завершено.'*) echo "partial called done"; bad=1 ;;
+    esac
+    case $text in
+        *'Подробнее: report'*) ;;
+        *) echo "human partial report"; bad=1 ;;
+    esac
+    case $text in
+        *'Синхронизация: сброс данных на носитель не подтверждён.'*) ;;
+        *) echo "human unconfirmed"; bad=1 ;;
+    esac
+    quc_copy_status=UNCERTAIN
+    text=$(quc_print_human)
+    case $text in
+        *'Результат копирования не подтверждён.'*) ;;
+        *) echo "human uncertain"; bad=1 ;;
+    esac
+    quc_answer_is_yes "да" || { echo "yes da"; bad=1; }
+    quc_answer_is_yes "yes" && { echo "yes english"; bad=1; }
+    quc_answer_is_yes "Да" && { echo "yes capital"; bad=1; }
+    quc_volume_candidate /dev/sdb1 vfat /media/DISK yes || { echo "vol accept"; bad=1; }
+    quc_volume_candidate /dev/weird-name1 exfat /media/ODD yes || { echo "vol odd name"; bad=1; }
+    quc_volume_candidate tmpfs tmpfs /media/DISK yes && { echo "vol tmpfs"; bad=1; }
+    quc_volume_candidate /dev/sda1 ext4 /home yes && { echo "vol home"; bad=1; }
+    quc_volume_candidate /dev/nvme0n1p1 ext4 /mnt/data no && { echo "vol internal"; bad=1; }
+    quc_volume_candidate /dev/mmcblk0p1 vfat /media/ODD unknown && { echo "vol unknown"; bad=1; }
+    volfile=$WORK/t-$current/volumes.tsv
+    if ! quc_collect_volumes "$volfile"; then
+        echo "collect failed"
+        bad=1
+    fi
+    if [ -f "$volfile" ]; then
+        while IFS= read -r vline || [ -n "$vline" ]; do
+            [ -n "$vline" ] || continue
+            vfs=$(printf '%s\n' "$vline" | awk -F '\t' 'NR == 1 { print $2; exit }')
+            vsrc_hex=$(printf '%s\n' "$vline" | awk -F '\t' 'NR == 1 { print $3; exit }')
+            vmp_hex=$(printf '%s\n' "$vline" | awk -F '\t' 'NR == 1 { print $1; exit }')
+            vrem=$(printf '%s\n' "$vline" | awk -F '\t' 'NR == 1 { print $6; exit }')
+            quc_decode_hex_var "$vsrc_hex" || { echo "src hex"; bad=1; continue; }
+            vsrc=$quc_decoded
+            quc_decode_hex_var "$vmp_hex" || { echo "mp hex"; bad=1; continue; }
+            vmp=$quc_decoded
+            case $vsrc in
+                /dev/*) ;;
+                *) echo "non-dev volume $vsrc"; bad=1 ;;
+            esac
+            if [ "$vrem" != yes ] || [ "$vfs" = tmpfs ] || [ "$vmp" = / ]; then
+                echo "volume policy fs=$vfs rem=$vrem mp=$vmp"
+                bad=1
+            fi
+        done < "$volfile"
+    fi
+
+    plant_job() {
+        pj_id=$1
+        pj_status=$2
+        quc_default_job_vars
+        quc_job_id=$pj_id
+        quc_source=$keep
+        quc_target=$destkeep
+        quc_source_spec=tmpfs
+        quc_target_spec=tmpfs
+        quc_copy_status=$pj_status
+        quc_profile=gentle
+        quc_files_done=2
+        quc_files_total=4
+        quc_verify_status=none
+        quc_sync_status=unconfirmed
+        quc_job_dir=$quc_jobs_dir/$pj_id
+        mkdir -p "$quc_job_dir" || return 1
+        quc_log_file=$quc_job_dir/log
+        printf 'kept\n' > "$quc_log_file" || return 1
+        quc_save_state || return 1
+    }
+    keep=$WORK/t-$current/user-data
+    destkeep=$WORK/t-$current/user-dest
+    mkdir -p "$keep" "$destkeep"
+    printf 'keep\n' > "$keep/file.txt"
+    printf 'dest\n' > "$destkeep/file.txt"
+    if ! quc_prepare_state || ! quc_runtime_prepare; then
+        echo "state or runtime prepare"
+        bad=1
+    else
+        quc_default_job_vars
+        quc_job_id=empty-spec-1
+        quc_source=$keep
+        quc_target=$destkeep
+        quc_copy_status=FAILED
+        quc_job_dir=$quc_jobs_dir/empty-spec-1
+        mkdir -p "$quc_job_dir"
+        quc_log_file=$quc_job_dir/log
+        : > "$quc_log_file"
+        if ! quc_save_state || ! quc_load_state "$quc_job_dir/state" || [ "$quc_copy_status" != FAILED ] || [ -n "$quc_source_spec" ]; then
+            echo "empty spec did not load"
+            bad=1
+        fi
+        rm -rf "$quc_jobs_dir/empty-spec-1"
+        plant_job cleanup-success-1 SUCCESS || { echo "plant success"; bad=1; }
+        plant_job cleanup-running-1 RUNNING || { echo "plant running"; bad=1; }
+        mkdir -p "$quc_jobs_dir/cleanup-bad-1"
+        printf 'copy_status=SUCCESS\n' > "$quc_jobs_dir/cleanup-bad-1/state"
+        ln -s /tmp "$quc_jobs_dir/cleanup-link-1"
+        printf '%s\n' cleanup-success-1 > "$quc_current"
+        mkdir -p "$quc_runtime_base/jobs/cleanup-success-1" "$quc_runtime_base/jobs/cleanup-running-1"
+        printf 'plan\n' > "$quc_runtime_base/jobs/cleanup-success-1/plan.hex"
+        printf 'plan\n' > "$quc_runtime_base/jobs/cleanup-running-1/plan.hex"
+        printf 'menu\n' > "$quc_runtime_base/menu.42"
+        printf 'held\n' > "$quc_lockfile"
+        run_quiet "$SH" "$SCRIPT" cleanup
+        if [ "$quc_ec" -ne 0 ]; then
+            echo "cleanup ec=$quc_ec"
+            cat "$quc_out" "$quc_err"
+            bad=1
+        fi
+        if ! grep -q '^Удалено служебных заданий: 2$' "$quc_out" || ! grep -q '^Оставлено незавершённых: 2$' "$quc_out"; then
+            echo "cleanup counts"
+            cat "$quc_out" "$quc_err"
+            bad=1
+        fi
+        if [ -d "$quc_jobs_dir/cleanup-success-1" ] || [ ! -d "$quc_jobs_dir/cleanup-running-1" ]; then
+            echo "cleanup removed the wrong job"
+            bad=1
+        fi
+        if [ ! -f "$quc_jobs_dir/cleanup-running-1/state" ] || [ ! -f "$quc_jobs_dir/cleanup-running-1/log" ]; then
+            echo "running recovery files missing"
+            bad=1
+        fi
+        if ! grep -q '^copy_status=RUNNING$' "$quc_jobs_dir/cleanup-running-1/state" || ! grep -q '^profile=gentle$' "$quc_jobs_dir/cleanup-running-1/state"; then
+            echo "running state changed"
+            bad=1
+        fi
+        if [ -e "$quc_runtime_base/jobs/cleanup-success-1" ] || [ ! -f "$quc_runtime_base/jobs/cleanup-running-1/plan.hex" ]; then
+            echo "runtime scratch policy"
+            bad=1
+        fi
+        if [ -e "$quc_runtime_base/menu.42" ] || [ -L "$quc_jobs_dir/cleanup-link-1" ] || [ ! -d "$quc_jobs_dir/cleanup-bad-1" ]; then
+            echo "menu, link, or unreadable job"
+            bad=1
+        fi
+        if [ -f "$quc_current" ]; then
+            echo "current still points at a removed job"
+            bad=1
+        fi
+        if [ ! -f "$quc_lockfile" ] || [ ! -f "$keep/file.txt" ] || [ ! -f "$destkeep/file.txt" ]; then
+            echo "cleanup touched user data or lockfile"
+            bad=1
+        fi
+        rm -rf "$quc_jobs_dir/cleanup-running-1" "$quc_jobs_dir/cleanup-bad-1" "$quc_runtime_base/jobs/cleanup-running-1"
+        plant_job cleanup-success-2 SUCCESS || { echo "plant success 2"; bad=1; }
+        printf '%s\n' cleanup-success-2 > "$quc_current"
+        printf 'pid=1\nstarttime=1\ntoken=t\njob=cleanup-success-2\n' > "$quc_owner"
+        printf 'held\n' > "$quc_lockfile"
+        mkdir -p "$quc_state_dir/lock.d"
+        printf 'err\n' > "$quc_last_error"
+        run_quiet "$SH" "$SCRIPT" cleanup
+        if [ "$quc_ec" -ne 0 ] || ! grep -q '^Удалено служебных заданий: 1$' "$quc_out" || ! grep -q '^Оставлено незавершённых: 0$' "$quc_out"; then
+            echo "second cleanup"
+            cat "$quc_out" "$quc_err"
+            bad=1
+        fi
+        if [ -d "$quc_jobs_dir/cleanup-success-2" ] || [ ! -f "$quc_lockfile" ] || [ -f "$quc_owner" ] || [ -f "$quc_last_error" ] || [ -d "$quc_state_dir/lock.d" ] || [ -f "$quc_current" ]; then
+            echo "finished-job cleanup leftovers"
+            bad=1
+        fi
+        if [ ! -f "$keep/file.txt" ] || [ ! -f "$destkeep/file.txt" ]; then
+            echo "user files removed"
+            bad=1
+        fi
+    fi
+    quc_run_dir=
+    quc_runtime_base=
+    quc_job_dir=
+    quc_stop_requested=0
+
     if [ "$bad" -eq 0 ]; then
         pass
     else
@@ -775,6 +1003,39 @@ PY
     fi
     if grep -q 'можно извлекать' "$quc_out"; then
         echo "status allows removal"
+        bad=1
+    fi
+    if [ "$(job_field profile)" != gentle ]; then
+        echo "profile $(job_field profile)"
+        bad=1
+    fi
+    run_quiet "$SH" "$SCRIPT" status --human
+    if grep -q 'copy_status=' "$quc_out" || grep -q 'можно извлекать' "$quc_out" || ! grep -q 'Копирование завершено.' "$quc_out" || ! grep -q 'Для извлечения' "$quc_out" || ! grep -q 'Файлы:' "$quc_out" || ! grep -q 'Проверка содержимого:' "$quc_out" || ! grep -q 'Синхронизация:' "$quc_out"; then
+        echo "human status"
+        cat "$quc_out" "$quc_err"
+        bad=1
+    fi
+    run_quiet "$SH" "$SCRIPT" status --machine
+    if ! grep -q '^copy_status=SUCCESS$' "$quc_out"; then
+        echo "machine status"
+        cat "$quc_out"
+        bad=1
+    fi
+    run_quiet "$SH" "$SCRIPT" status --human --verbose
+    if ! grep -q 'Копирование завершено.' "$quc_out" || ! grep -q 'Диагностика:' "$quc_out" || ! grep -q '^copy_status=SUCCESS$' "$quc_out" || ! grep -q '^profile=gentle$' "$quc_out"; then
+        echo "verbose human status"
+        cat "$quc_out"
+        bad=1
+    fi
+    jid=$(cat "$XDG_STATE_HOME/quiet-usb-copy/current")
+    jdir=$XDG_STATE_HOME/quiet-usb-copy/jobs/$jid
+    if [ ! -f "$jdir/state" ] || [ ! -f "$jdir/log" ] || [ -e "$jdir/plan.hex" ] || [ -e "$jdir/plan.0" ] || [ -e "$jdir/transfer.err" ] || [ -e "$jdir/ready" ]; then
+        echo "scratch left in the job dir"
+        find "$jdir" -maxdepth 1 -print
+        bad=1
+    fi
+    if [ -d "$XDG_RUNTIME_DIR/quiet-usb-copy/jobs/$jid" ] || [ -d "$XDG_STATE_HOME/quiet-usb-copy/run/jobs/$jid" ]; then
+        echo "runtime job dir remains"
         bad=1
     fi
     if [ "$bad" -eq 0 ]; then pass; else fail "recursive copy"; fi
@@ -1672,6 +1933,79 @@ test_T27() {
     if [ "$bad" -eq 0 ]; then pass; else fail "unplug status=$st"; fi
 }
 
+test_dx() {
+    bad=0
+    run_quiet "$SH" "$SCRIPT" version
+    if [ "$quc_ec" -ne 0 ] || ! grep -q '^quiet-usb-copy 0.3.0$' "$quc_out" || ! grep -q '^build 20261029.2$' "$quc_out"; then
+        echo "version"
+        bad=1
+    fi
+    run_quiet "$SH" "$SCRIPT" help
+    if [ "$quc_ec" -ne 0 ] || ! grep -q 'doctor' "$quc_out" || ! grep -q 'selftest' "$quc_out" || ! grep -q 'gentle' "$quc_out"; then
+        echo "help"
+        bad=1
+    fi
+    run_quiet "$SH" "$SCRIPT"
+    if [ "$quc_ec" -ne 2 ] || ! grep -q 'error_code=E_USAGE' "$quc_err" || ! grep -q 'только в терминале' "$quc_err"; then
+        echo "no-args ec=$quc_ec"
+        cat "$quc_out" "$quc_err"
+        bad=1
+    fi
+    if [ -d "$XDG_STATE_HOME/quiet-usb-copy" ]; then
+        echo "no-args created state"
+        bad=1
+    fi
+    run_quiet "$SH" "$SCRIPT" selftest
+    if [ "$quc_ec" -ne 0 ] || [ "$quc_err_n" != 0 ] || ! grep -q '^selftest: готово$' "$quc_out" || ! grep -q '^error_code=E_OK$' "$quc_out"; then
+        echo "selftest ec=$quc_ec"
+        cat "$quc_out" "$quc_err"
+        bad=1
+    fi
+    run_quiet "$SH" "$SCRIPT" selftest extra
+    if [ "$quc_ec" -ne 2 ] || ! grep -q 'error_code=E_USAGE' "$quc_err"; then
+        echo "selftest args"
+        bad=1
+    fi
+    run_quiet "$SH" "$SCRIPT" doctor
+    if [ "$quc_ec" -ne 0 ] || ! grep -q '^error_code=E_OK$' "$quc_out" || ! grep -q 'find -print0: да' "$quc_out" || ! grep -q '^sync-проба: data$' "$quc_out" || ! grep -q 'Pop!_OS 24.04' "$quc_out" || ! grep -q 'не отмечены как проверенные' "$quc_out"; then
+        echo "doctor"
+        cat "$quc_out" "$quc_err"
+        bad=1
+    fi
+    run_quiet "$SH" "$SCRIPT" doctor extra
+    if [ "$quc_ec" -ne 2 ] || ! grep -q 'error_code=E_USAGE' "$quc_err"; then
+        echo "doctor args"
+        bad=1
+    fi
+    run_quiet "$SH" "$SCRIPT" start --profile fast
+    if [ "$quc_ec" -ne 2 ] || [ "$quc_out_n" != 0 ] || [ "$quc_err_n" != 0 ]; then
+        echo "fast profile noisy ec=$quc_ec out=$quc_out_n err=$quc_err_n"
+        cat "$quc_out" "$quc_err"
+        bad=1
+    fi
+    if [ -f "$XDG_STATE_HOME/quiet-usb-copy/current" ] || [ -n "$(find "$XDG_STATE_HOME/quiet-usb-copy/jobs" -mindepth 1 -print 2>/dev/null)" ]; then
+        echo "fast profile created a job"
+        bad=1
+    fi
+    if ! grep -q 'неизвестный профиль' "$XDG_STATE_HOME/quiet-usb-copy/last-error"; then
+        echo "fast profile last-error"
+        cat "$XDG_STATE_HOME/quiet-usb-copy/last-error" 2>/dev/null
+        bad=1
+    fi
+    run_quiet "$SH" "$SCRIPT" cleanup extra
+    if [ "$quc_ec" -ne 2 ] || ! grep -q 'error_code=E_USAGE' "$quc_err"; then
+        echo "cleanup args"
+        bad=1
+    fi
+    run_quiet "$SH" "$SCRIPT" status --machine
+    if [ "$quc_ec" -ne 1 ] || ! grep -q 'error_code=E_NOJOB' "$quc_out"; then
+        echo "missing job"
+        cat "$quc_out" "$quc_err"
+        bad=1
+    fi
+    if [ "$bad" -eq 0 ]; then pass; else fail "dx commands"; fi
+}
+
 test_legacy() {
     bad=0
     make_pair || { fail "mount"; return; }
@@ -1686,6 +2020,490 @@ test_legacy() {
     if [ "$bad" -eq 0 ]; then pass; else fail "legacy two-argument start"; fi
 }
 
+pty_run() {
+    pin=$1
+    shift
+    quc_out=$WORK/last.out
+    quc_meta=$WORK/last.pty
+    : > "$quc_out"
+    : > "$quc_meta"
+    python3 "$ROOT/tests/pty_menu.py" --timeout "${QUC_PTY_TIMEOUT:-30}" --input "$pin" --output "$quc_out" -- "$@" >"$quc_meta" 2>"$WORK/last.err"
+    quc_pty_rc=$?
+    quc_ec=$(awk -F= '$1 == "PTY_EXIT" { print $2; exit }' "$quc_meta")
+    quc_pty_first=$(awk -F= '$1 == "PTY_FIRST" { print $2; exit }' "$quc_meta")
+    quc_pty_esc=$(awk -F= '$1 == "PTY_ESC" { print $2; exit }' "$quc_meta")
+}
+
+no_esc() {
+    python3 -c 'import sys; data=open(sys.argv[1],"rb").read(); raise SystemExit(0 if b"\x1b" not in data else 1)' "$1"
+}
+
+fake_row() {
+    printf '%s\t%s\t%s\t%s\t%s\tyes\t%s\n' \
+        "$(quc_hex_encode "$1")" "$2" "$(quc_hex_encode "$3")" "$(quc_hex_encode "$4")" "${5:-0}" "${6:-}"
+}
+
+test_UX01() {
+    bad=0
+    make_pair || { fail "mount"; return; }
+    printf 'slide\n' > "$src/deck.txt"
+    fake=$WORK/t-$current/fake.tsv
+    fake_row "$src" ext4 tmpfs PRESENTATION 33554432 30000000 > "$fake"
+    fake_row "$dst" ext4 tmpfs BACKUP 67108864 65000000 >> "$fake"
+    export QUC_FAKE_VOLUMES=$fake
+    printf '1\n2\n1\n' > "$WORK/t-$current/in"
+    pty_run "$WORK/t-$current/in" /bin/sh "$SCRIPT"
+    if [ "$quc_pty_rc" -ne 0 ] || [ "$quc_ec" != 0 ]; then
+        echo "pty ec=$quc_ec driver=$quc_pty_rc"
+        cat "$quc_out" "$quc_meta" "$WORK/last.err"
+        bad=1
+    fi
+    if ! awk -v t="${quc_pty_first:-99}" 'BEGIN { exit !(t+0 >= 0 && t+0 < 3) }'; then
+        echo "menu slow first=$quc_pty_first"
+        bad=1
+    fi
+    if ! grep -q 'Quiet USB Copy' "$quc_out" || ! grep -q 'PRESENTATION' "$quc_out" || ! grep -q 'BACKUP' "$quc_out" || ! grep -q 'Проверка: готово' "$quc_out" || ! grep -q 'Копирование запущено в фоне' "$quc_out"; then
+        echo "menu text"
+        cat "$quc_out"
+        bad=1
+    fi
+    if ! awk 'index($0, "Проверка: готово") { seen=1 } index($0, "Копирование запущено") { if (!seen) bad=1 } END { exit bad+0 }' "$quc_out"; then
+        echo "launch before preflight"
+        bad=1
+    fi
+    st=$(wait_done 40)
+    if [ "$st" != SUCCESS ]; then
+        echo "status=$st"
+        bad=1
+    fi
+    run_quiet "$SH" "$SCRIPT" status --human
+    if ! grep -q 'Копирование завершено.' "$quc_out" || grep -q 'copy_status=' "$quc_out" || grep -q 'можно извлекать' "$quc_out"; then
+        echo "calm status"
+        cat "$quc_out"
+        bad=1
+    fi
+    if [ "$bad" -eq 0 ]; then pass; else fail "interactive start"; fi
+}
+
+test_UX02() {
+    bad=0
+    printf '0\n' > "$WORK/t-$current/in"
+    pty_run "$WORK/t-$current/in" /bin/sh "$SCRIPT"
+    if [ "$quc_ec" != 0 ] || ! grep -q 'Копирование не запущено.' "$quc_out" || ! grep -q 'error_code=E_OK' "$quc_out" || grep -q 'Копирование запущено' "$quc_out"; then
+        echo "cancel"
+        cat "$quc_out" "$quc_meta"
+        bad=1
+    fi
+    if [ -f "$XDG_STATE_HOME/quiet-usb-copy/current" ]; then
+        echo "cancel created a job"
+        bad=1
+    fi
+    if [ "$bad" -eq 0 ]; then pass; else fail "cancel"; fi
+}
+
+test_UX03() {
+    bad=0
+    make_pair || { fail "mount"; return; }
+    printf '%s\n%s\n1\n0\n' "$src" "$src" > "$WORK/t-$current/in"
+    pty_run "$WORK/t-$current/in" /bin/sh "$SCRIPT"
+    if [ "$quc_ec" != 0 ] || ! grep -q 'один и тот же' "$quc_out" || ! grep -q 'запускать нельзя' "$quc_out" || ! grep -q 'Запуск запрещён.' "$quc_out" || grep -q 'Копирование запущено' "$quc_out"; then
+        echo "same device"
+        cat "$quc_out"
+        bad=1
+    fi
+    if [ -f "$XDG_STATE_HOME/quiet-usb-copy/current" ]; then
+        echo "reject created a job"
+        bad=1
+    fi
+    if [ "$bad" -eq 0 ]; then pass; else fail "same device"; fi
+}
+
+test_UX04() {
+    bad=0
+    run_quiet "$SH" "$SCRIPT" </dev/null
+    if [ "$quc_ec" -ne 2 ] || ! grep -q 'только в терминале' "$quc_err" || ! grep -q 'error_code=E_USAGE' "$quc_err"; then
+        echo "no tty ec=$quc_ec"
+        cat "$quc_out" "$quc_err"
+        bad=1
+    fi
+    if [ -d "$XDG_STATE_HOME/quiet-usb-copy" ]; then
+        echo "no tty created state"
+        bad=1
+    fi
+    if [ "$bad" -eq 0 ]; then pass; else fail "no tty"; fi
+}
+
+test_UX05() {
+    bad=0
+    printf '0\n' > "$WORK/t-$current/in"
+    TERM=dumb NO_COLOR=1 pty_run "$WORK/t-$current/in" /bin/sh "$SCRIPT"
+    if [ "$quc_ec" != 0 ] || [ "$quc_pty_esc" != 0 ] || ! grep -q 'Quiet USB Copy' "$quc_out" || ! no_esc "$quc_out"; then
+        echo "color esc=$quc_pty_esc"
+        cat "$quc_out" "$quc_meta"
+        bad=1
+    fi
+    if [ "$bad" -eq 0 ]; then pass; else fail "no color"; fi
+}
+
+test_UX06() {
+    bad=0
+    make_pair || { fail "mount"; return; }
+    third=$WORK/t-$current/third
+    mkdir -p "$third"
+    mount -t tmpfs -o size=8m tmpfs "$third" || { fail "mount"; return; }
+    fake=$WORK/t-$current/fake.tsv
+    fake_row "$src" ext4 tmpfs ONE 1000 1000 > "$fake"
+    fake_row "$dst" ext4 tmpfs TWO 2000 2000 >> "$fake"
+    fake_row "$third" ext4 tmpfs THREE 3000 3000 >> "$fake"
+    export QUC_FAKE_VOLUMES=$fake
+    printf '1\n2\n0\n' > "$WORK/t-$current/in"
+    pty_run "$WORK/t-$current/in" /bin/sh "$SCRIPT"
+    if [ "$quc_ec" != 0 ] || ! grep -q 'ONE' "$quc_out" || ! grep -q 'TWO' "$quc_out" || ! grep -q 'THREE' "$quc_out" || ! grep -q 'ONE → TWO' "$quc_out" || ! grep -q 'Проверка: готово' "$quc_out" || grep -q 'Копирование запущено' "$quc_out"; then
+        echo "several"
+        cat "$quc_out"
+        bad=1
+    fi
+    if [ "$bad" -eq 0 ]; then pass; else fail "several volumes"; fi
+}
+
+test_UX07() {
+    bad=0
+    make_pair || { fail "mount"; return; }
+    fake=$WORK/t-$current/fake.tsv
+    printf '%s\text4\t%s\t\t1000\tyes\t1000\n' "$(quc_hex_encode "$src")" "$(quc_hex_encode tmpfs)" > "$fake"
+    esc_label=$(printf 'A\033B')
+    fake_row "$dst" ext4 tmpfs "$esc_label" 2000 2000 >> "$fake"
+    export QUC_FAKE_VOLUMES=$fake
+    printf '1\n2\n0\n' > "$WORK/t-$current/in"
+    pty_run "$WORK/t-$current/in" /bin/sh "$SCRIPT"
+    if [ "$quc_ec" != 0 ] || ! grep -q 'без метки' "$quc_out" || ! grep -q 'Проверка: готово' "$quc_out" || ! no_esc "$quc_out"; then
+        echo "unlabeled"
+        cat "$quc_out"
+        bad=1
+    fi
+    if ! grep -q 'без метки →' "$quc_out"; then
+        echo "direction label"
+        cat "$quc_out"
+        bad=1
+    fi
+    if [ "$bad" -eq 0 ]; then pass; else fail "unlabeled volume"; fi
+}
+
+test_UX08() {
+    bad=0
+    lim=$WORK/t-$current/bin
+    mkdir -p "$lim"
+    for tool in find stat awk od tr mkdir rmdir rm mv ln chmod date readlink sleep cat cp grep dirname basename; do
+        srcbin=$(PATH=$ORIG_PATH command -v "$tool") || { echo "missing $tool"; bad=1; break; }
+        ln -s "$srcbin" "$lim/$tool"
+    done
+    make_pair || { fail "mount"; return; }
+    printf 'x\n' > "$src/a.txt"
+    printf '%s\n%s\n0\n' "$src" "$dst" > "$WORK/t-$current/in"
+    py=$(PATH=$ORIG_PATH command -v python3)
+    env PATH="$lim" "$py" "$ROOT/tests/pty_menu.py" --timeout 30 --input "$WORK/t-$current/in" --output "$WORK/last.out" -- /bin/sh "$SCRIPT" >"$WORK/last.pty" 2>"$WORK/last.err"
+    quc_ec=$(awk -F= '$1 == "PTY_EXIT" { print $2; exit }' "$WORK/last.pty")
+    if [ "$quc_ec" != 0 ] || ! grep -q 'Проверка: готово' "$WORK/last.out" || grep -q 'Копирование запущено' "$WORK/last.out"; then
+        echo "optional tools ec=$quc_ec"
+        cat "$WORK/last.out" "$WORK/last.err"
+        bad=1
+    fi
+    if env PATH="$lim" command -v findmnt >/dev/null 2>&1; then
+        echo "findmnt still visible"
+        bad=1
+    fi
+    if [ "$bad" -eq 0 ]; then pass; else fail "missing optional tools"; fi
+}
+
+test_UX09() {
+    bad=0
+    make_pair || { fail "mount"; return; }
+    printf 'x\n' > "$src/a.txt"
+    run_start "$src" "$src"
+    if [ "$quc_ec" -eq 0 ] || [ "$quc_noisy" -ne 0 ]; then
+        echo "noisy failure ec=$quc_ec"
+        bad=1
+    fi
+    run_quiet "$SH" "$SCRIPT" status --human
+    if ! grep -q 'Копирование не выполнено.' "$quc_out" || ! grep -q 'Причина:' "$quc_out" || ! grep -q 'Подробнее: report' "$quc_out" || grep -q 'copy_status=' "$quc_out"; then
+        echo "calm failure"
+        cat "$quc_out" "$quc_err"
+        bad=1
+    fi
+    if grep -q 'notify-send' "$quc_out" || grep -q 'zenity' "$quc_out"; then
+        echo "notification text"
+        bad=1
+    fi
+    # A desktop notifier already running is not this program. Ours would
+    # inherit the test's XDG_STATE_HOME. cat hides processes we cannot read.
+    for cmdf in /proc/[0-9]*/cmdline; do
+        data=$(tr '\0' ' ' < "$cmdf" 2>/dev/null || true)
+        case $data in
+            *notify-send*|*zenity*) ;;
+            *) continue ;;
+        esac
+        npid=${cmdf#/proc/}
+        npid=${npid%/cmdline}
+        envs=$(cat "/proc/$npid/environ" 2>/dev/null | tr '\0' '\n' || true)
+        case $envs in
+            *"XDG_STATE_HOME=$XDG_STATE_HOME"*)
+                echo "notification process $npid"
+                bad=1
+                ;;
+        esac
+    done
+    if [ "$bad" -eq 0 ]; then pass; else fail "silent failure"; fi
+}
+
+test_UX10() {
+    bad=0
+    make_pair || { fail "mount"; return; }
+    printf 'plain\n' > "$src/note.txt"
+    run_start "$src" "$dst"
+    if [ "$quc_ec" -ne 0 ] || [ "$quc_noisy" -ne 0 ]; then
+        bad=1
+    fi
+    st=$(wait_done 40)
+    if [ "$st" != SUCCESS ]; then
+        echo "status=$st"
+        bad=1
+    fi
+    run_quiet "$SH" "$SCRIPT" status --human
+    if ! grep -q 'Копирование завершено.' "$quc_out" || ! grep -q 'Проверка содержимого:' "$quc_out" || ! grep -q 'Для извлечения используйте средства ОС.' "$quc_out" || grep -q 'copy_status=' "$quc_out" || grep -q 'можно извлекать' "$quc_out"; then
+        echo "human success"
+        cat "$quc_out"
+        bad=1
+    fi
+    quc_default_job_vars
+    quc_copy_status=PARTIAL
+    quc_error='ошибка чтения'
+    quc_verify_status=none
+    quc_sync_status=unconfirmed
+    quc_profile=gentle
+    text=$(quc_print_human)
+    case $text in
+        *'Копирование завершено частично.'*) ;;
+        *) echo "partial phrase"; bad=1 ;;
+    esac
+    case $text in
+        *'Причина: ошибка чтения'*) ;;
+        *) echo "partial reason"; bad=1 ;;
+    esac
+    case $text in
+        *'Подробнее: report'*) ;;
+        *) echo "partial more"; bad=1 ;;
+    esac
+    case $text in
+        *'Копирование завершено.'*) echo "partial called done"; bad=1 ;;
+    esac
+    quc_copy_status=RUNNING
+    quc_error=
+    text=$(quc_print_human)
+    case $text in
+        *'Копирование выполняется.'*) ;;
+        *) echo "running phrase"; bad=1 ;;
+    esac
+    if [ "$bad" -eq 0 ]; then pass; else fail "plain status"; fi
+}
+
+test_UX11() {
+    bad=0
+    quc_resolve_tools || bad=1
+    if ! quc_prepare_state; then
+        fail "state"
+        return
+    fi
+    keep=$WORK/t-$current/user-data
+    mkdir -p "$keep"
+    printf 'keep\n' > "$keep/file.txt"
+    plant_one() {
+        pj_id=$1
+        pj_status=$2
+        quc_default_job_vars
+        quc_job_id=$pj_id
+        quc_source=$keep
+        quc_target=$keep-dst
+        mkdir -p "$quc_target"
+        quc_source_spec=tmpfs
+        quc_target_spec=tmpfs
+        quc_copy_status=$pj_status
+        quc_profile=gentle
+        quc_job_dir=$quc_jobs_dir/$pj_id
+        mkdir -p "$quc_job_dir"
+        quc_log_file=$quc_job_dir/log
+        printf 'log\n' > "$quc_log_file"
+        quc_save_state
+    }
+    plant_one ux-success SUCCESS || bad=1
+    plant_one ux-running RUNNING || bad=1
+    printf '%s\n' ux-success > "$quc_current"
+    run_quiet "$SH" "$SCRIPT" cleanup --dry-run
+    if [ "$quc_ec" -ne 0 ] || ! grep -q '^Удаление не выполнялось.$' "$quc_out" || ! grep -q '^Можно удалить: ux-success$' "$quc_out" || ! grep -q 'ux-running' "$quc_out" || ! grep -q '^Будет удалено служебных заданий: 1$' "$quc_out"; then
+        echo "dry-run"
+        cat "$quc_out" "$quc_err"
+        bad=1
+    fi
+    if [ ! -d "$quc_jobs_dir/ux-success" ] || [ ! -d "$quc_jobs_dir/ux-running" ] || [ ! -f "$keep/file.txt" ]; then
+        echo "dry-run deleted data"
+        bad=1
+    fi
+    run_quiet "$SH" "$SCRIPT" cleanup
+    if [ "$quc_ec" -ne 0 ] || ! grep -q '^Удалено служебных заданий: 1$' "$quc_out" || ! grep -q '^Оставлено незавершённых: 1$' "$quc_out"; then
+        echo "cleanup"
+        cat "$quc_out"
+        bad=1
+    fi
+    if [ -d "$quc_jobs_dir/ux-success" ] || [ ! -d "$quc_jobs_dir/ux-running" ] || [ ! -f "$keep/file.txt" ]; then
+        echo "cleanup touched the wrong data"
+        bad=1
+    fi
+    if [ "$bad" -eq 0 ]; then pass; else fail "cleanup preview"; fi
+}
+
+test_UX12() {
+    bad=0
+    make_pair || { fail "mount"; return; }
+    printf 'done\n' > "$src/a.txt"
+    run_start "$src" "$dst"
+    if [ "$quc_ec" -ne 0 ] || [ "$quc_noisy" -ne 0 ]; then
+        bad=1
+    fi
+    st=$(wait_done 40)
+    if [ "$st" != SUCCESS ]; then
+        echo "status=$st"
+        bad=1
+    fi
+    sleep 0.3
+    if [ "$(count_live "$XDG_STATE_HOME/quiet-usb-copy")" != 0 ]; then
+        echo "workers left"
+        bad=1
+    fi
+    if [ "$bad" -eq 0 ]; then pass; else fail "leftover workers"; fi
+}
+
+test_UX13() {
+    bad=0
+    quc_resolve_tools || bad=1
+    text=$(quc_fs_caution mysteryfs)
+    case $text in
+        *'непроверен'*) ;;
+        *) echo "unknown fs: $text"; bad=1 ;;
+    esac
+    case $text in
+        *'запускать нельзя'*) echo "unknown fs blocks"; bad=1 ;;
+    esac
+    text=$(quc_fs_caution ext4)
+    if [ -n "$text" ]; then
+        echo "ext4 caution: $text"
+        bad=1
+    fi
+    text=$(quc_fs_caution vfat)
+    case $text in
+        *'FAT:'*) ;;
+        *) echo "fat caution"; bad=1 ;;
+    esac
+    make_pair || { fail "mount"; return; }
+    printf '%s\n%s\n0\n' "$src" "$dst" > "$WORK/t-$current/in"
+    pty_run "$WORK/t-$current/in" /bin/sh "$SCRIPT"
+    if [ "$quc_ec" != 0 ] || ! grep -q 'Проверка: готово' "$quc_out" || grep -q 'запускать нельзя' "$quc_out"; then
+        echo "known fs preflight"
+        cat "$quc_out"
+        bad=1
+    fi
+    if [ "$bad" -eq 0 ]; then pass; else fail "unknown filesystem"; fi
+}
+
+test_UX14() {
+    bad=0
+    src_a=$WORK/t-$current/src-a
+    dst_a=$WORK/t-$current/dst-a
+    src_b=$WORK/t-$current/src-b
+    dst_b=$WORK/t-$current/dst-b
+    mkdir -p "$src_a" "$dst_a" "$src_b" "$dst_b"
+    mount -t tmpfs -o size=16m tmpfs "$src_a" || { fail "mount"; return; }
+    mount -t tmpfs -o size=16m tmpfs "$dst_a" || { fail "mount"; return; }
+    mount -t tmpfs -o size=16m tmpfs "$src_b" || { fail "mount"; return; }
+    mount -t tmpfs -o size=16m tmpfs "$dst_b" || { fail "mount"; return; }
+    printf 'a\n' > "$src_a/a.txt"
+    printf 'b\n' > "$src_a/b.txt"
+    printf 'c\n' > "$src_b/c.txt"
+    export QUC_FILE_PAUSE=8
+    run_start "$src_a" "$dst_a"
+    if [ "$quc_ec" -ne 0 ] || [ "$quc_noisy" -ne 0 ]; then
+        bad=1
+    fi
+    if ! wait_phase pause 80; then
+        echo "phase=$(job_field phase)"
+        bad=1
+    fi
+    run_start "$src_b" "$dst_b"
+    if [ "$quc_ec" -eq 0 ] || [ "$quc_noisy" -ne 0 ]; then
+        echo "second start ec=$quc_ec"
+        bad=1
+    fi
+    if [ -e "$dst_b/c.txt" ]; then
+        echo "second copy wrote"
+        bad=1
+    fi
+    if [ "$(job_field copy_status)" != RUNNING ]; then
+        echo "first job $(job_field copy_status)"
+        bad=1
+    fi
+    if ! grep -q 'уже выполняется другое задание' "$XDG_STATE_HOME/quiet-usb-copy/last-error"; then
+        echo "conflict message"
+        cat "$XDG_STATE_HOME/quiet-usb-copy/last-error" 2>/dev/null
+        bad=1
+    fi
+    "$SH" "$SCRIPT" stop >/dev/null 2>&1 || bad=1
+    st=$(wait_done 40)
+    if [ "$st" != CANCELLED ] && [ "$st" != INTERRUPTED ]; then
+        echo "after stop $st"
+        bad=1
+    fi
+    if [ "$bad" -eq 0 ]; then pass; else fail "conflicting start"; fi
+}
+
+test_UX15() {
+    bad=0
+    make_pair || { fail "mount"; return; }
+    printf 'one\n' > "$src/a.txt"
+    printf 'two\n' > "$src/b.txt"
+    export QUC_FILE_PAUSE=6
+    run_start "$src" "$dst"
+    if [ "$quc_ec" -ne 0 ] || [ "$quc_noisy" -ne 0 ]; then
+        bad=1
+    fi
+    if ! wait_phase pause 80; then
+        echo "phase=$(job_field phase) status=$(job_field copy_status)"
+        bad=1
+    fi
+    run_quiet "$SH" "$SCRIPT" stop
+    st=$(wait_done 40)
+    if [ "$st" != CANCELLED ] && [ "$st" != INTERRUPTED ]; then
+        echo "stopped $st"
+        bad=1
+    fi
+    run_quiet "$SH" "$SCRIPT" status --human
+    if ! grep -q 'Копирование остановлено.' "$quc_out" || grep -q 'copy_status=' "$quc_out"; then
+        echo "stopped text"
+        cat "$quc_out"
+        bad=1
+    fi
+    unset QUC_FILE_PAUSE
+    run_resume
+    if [ "$quc_ec" -ne 0 ] || [ "$quc_noisy" -ne 0 ]; then
+        echo "resume noisy ec=$quc_ec"
+        bad=1
+    fi
+    st=$(wait_done 40)
+    if [ "$st" != SUCCESS ]; then
+        echo "resumed $st"
+        bad=1
+    fi
+    trees_ok "$src" "$dst" || bad=1
+    if [ "$bad" -eq 0 ]; then pass; else fail "resume after stop"; fi
+}
+
 if [ "$(id -u)" != 0 ]; then
     echo "FAIL setup: user namespace did not map root"
     exit 1
@@ -1697,6 +2515,7 @@ QUC_SOURCE_ONLY=1
 unset QUC_SOURCE_ONLY
 
 run_case U-static test_static
+run_case U-dx test_dx
 run_case U-units test_units
 run_case T01 test_T01
 run_case T02 test_T02
@@ -1726,6 +2545,21 @@ run_case T25 test_T25
 run_case T26 test_T26
 run_case T27 test_T27
 run_case U-legacy test_legacy
+run_case UX01 test_UX01
+run_case UX02 test_UX02
+run_case UX03 test_UX03
+run_case UX04 test_UX04
+run_case UX05 test_UX05
+run_case UX06 test_UX06
+run_case UX07 test_UX07
+run_case UX08 test_UX08
+run_case UX09 test_UX09
+run_case UX10 test_UX10
+run_case UX11 test_UX11
+run_case UX12 test_UX12
+run_case UX13 test_UX13
+run_case UX14 test_UX14
+run_case UX15 test_UX15
 
 leaked=$(count_live "$WORK")
 if [ "$leaked" != 0 ]; then

@@ -5,6 +5,7 @@
 # Copyright (C) 2026 AdmiralGDR
 #
 # Quiet USB Copy — тихое копирование одного смонтированного накопителя на другой.
+# Запуск без аргументов в терминале показывает один экран выбора съёмных накопителей.
 # Запуск: sh quiet_usb_copy.sh start ИСТОЧНИК НАЗНАЧЕНИЕ
 # Права только текущего пользователя. Пароль не запрашивается.
 # Обычный запуск start ничего не печатает и не открывает окон.
@@ -18,7 +19,8 @@
 
 umask 077
 
-QUC_VERSION=1
+QUC_VERSION=0.3.0
+QUC_BUILD=20261029.2
 QUC_PARTIAL_PREFIX=.quc-partial.
 QUC_MAX_ATTEMPTS=3
 QUC_FAT_MAX=4294967295
@@ -343,6 +345,108 @@ quc_prepare_state() {
     return 0
 }
 
+quc_runtime_prepare() {
+    quc_runtime_base=
+    raw=${XDG_RUNTIME_DIR:-}
+    [ -n "$raw" ] || return 1
+    case $raw in
+        /*) ;;
+        *) return 1 ;;
+    esac
+    if [ ! -d "$raw" ] || [ -L "$raw" ]; then
+        return 1
+    fi
+    base=$raw/quiet-usb-copy
+    if [ -L "$base" ]; then
+        return 1
+    fi
+    if [ ! -d "$base" ]; then
+        "$quc_bin_mkdir" -p -- "$base" 2>/dev/null || return 1
+    fi
+    if [ -L "$base" ] || [ ! -d "$base" ]; then
+        return 1
+    fi
+    "$quc_bin_chmod" 700 -- "$base" 2>/dev/null || return 1
+    quc_runtime_base=$base
+    return 0
+}
+
+quc_open_run_dir() {
+    quc_run_dir=${quc_job_dir:-}
+    quc_job_id_safe "${quc_job_id:-}" || return 0
+    parent=
+    if quc_runtime_prepare; then
+        parent=$quc_runtime_base/jobs
+    elif [ -n "${quc_state_dir:-}" ] && [ ! -L "$quc_state_dir" ] && [ -d "$quc_state_dir" ]; then
+        parent=$quc_state_dir/run/jobs
+    else
+        return 0
+    fi
+    if [ -L "$parent" ]; then
+        return 0
+    fi
+    "$quc_bin_mkdir" -p -- "$parent" 2>/dev/null || return 0
+    "$quc_bin_chmod" 700 -- "$parent" 2>/dev/null || return 0
+    dest=$parent/$quc_job_id
+    if [ -L "$dest" ]; then
+        return 0
+    fi
+    "$quc_bin_mkdir" -p -- "$dest" 2>/dev/null || return 0
+    "$quc_bin_chmod" 700 -- "$dest" 2>/dev/null || return 0
+    if [ -L "$dest" ] || [ ! -d "$dest" ]; then
+        return 0
+    fi
+    quc_run_dir=$dest
+    return 0
+}
+
+quc_scratch_file() {
+    sc_base=${quc_run_dir:-$quc_job_dir}
+    printf '%s\n' "$sc_base/$1"
+}
+
+quc_rm_owned_dir() {
+    target=$1
+    [ -n "$target" ] || return 1
+    if [ -L "$target" ]; then
+        return 1
+    fi
+    if [ ! -d "$target" ]; then
+        return 0
+    fi
+    ok=0
+    if [ -n "${quc_runtime_base:-}" ]; then
+        case $target in
+            "$quc_runtime_base"/jobs/*) ok=1 ;;
+        esac
+    fi
+    if [ -n "${quc_state_dir:-}" ]; then
+        case $target in
+            "$quc_state_dir"/run/jobs/*) ok=1 ;;
+        esac
+    fi
+    if [ "$ok" != 1 ]; then
+        return 1
+    fi
+    owned_id=$("$quc_bin_basename" -- "$target")
+    quc_job_id_safe "$owned_id" || return 1
+    "$quc_bin_rm" -rf -- "$target"
+}
+
+quc_drop_scratch() {
+    if [ -n "${quc_run_dir:-}" ] && [ -n "${quc_job_dir:-}" ] && [ "$quc_run_dir" != "$quc_job_dir" ]; then
+        quc_rm_owned_dir "$quc_run_dir" || true
+    fi
+    base=${quc_job_dir:-}
+    if [ -z "$base" ] || [ ! -d "$base" ] || [ -L "$base" ]; then
+        return 0
+    fi
+    for sc_name in plan.0 plan.hex plan2.hex extra.hex now.hex new.hex gone.hex dest-scan.hex nested.seen probe-in probe-out sync-probe.err transfer.err verify.hex last-error-line childpid spawn.pid ready; do
+        "$quc_bin_rm" -f -- "$base/$sc_name" 2>/dev/null || true
+    done
+    return 0
+}
+
 quc_note_error() {
     if [ -n "${quc_state_dir:-}" ] && [ -n "${quc_last_error:-}" ]; then
         printf '%s\n' "$(quc_one_line "$1")" > "$quc_last_error" 2>/dev/null || true
@@ -398,17 +502,85 @@ quc_default_job_vars() {
     quc_sync_unconfirmed=0
     quc_sync_status=unconfirmed
     quc_sync_mode=
+    quc_profile=gentle
     quc_fatal_kind=''
+}
+
+# Повторное кодирование одних и тех же путей на каждом файле плодит процессы od.
+# Кэш живёт в этой оболочке: подстановка $(...) сбросила бы его в подоболочке.
+quc_encode_cached() {
+    ec_slot=$1
+    ec_val=$2
+    case $ec_slot in
+        source)
+            if [ "${quc_hx_source_set:-}" = 1 ] && [ "$quc_hx_source_raw" = "$ec_val" ]; then
+                quc_hex_out=$quc_hx_source
+                return 0
+            fi
+            quc_hx_source=$(quc_hex_encode "$ec_val")
+            quc_hx_source_raw=$ec_val
+            quc_hx_source_set=1
+            quc_hex_out=$quc_hx_source
+            ;;
+        target)
+            if [ "${quc_hx_target_set:-}" = 1 ] && [ "$quc_hx_target_raw" = "$ec_val" ]; then
+                quc_hex_out=$quc_hx_target
+                return 0
+            fi
+            quc_hx_target=$(quc_hex_encode "$ec_val")
+            quc_hx_target_raw=$ec_val
+            quc_hx_target_set=1
+            quc_hex_out=$quc_hx_target
+            ;;
+        source_spec)
+            if [ "${quc_hx_ssp_set:-}" = 1 ] && [ "$quc_hx_ssp_raw" = "$ec_val" ]; then
+                quc_hex_out=$quc_hx_ssp
+                return 0
+            fi
+            quc_hx_ssp=$(quc_hex_encode "$ec_val")
+            quc_hx_ssp_raw=$ec_val
+            quc_hx_ssp_set=1
+            quc_hex_out=$quc_hx_ssp
+            ;;
+        target_spec)
+            if [ "${quc_hx_tsp_set:-}" = 1 ] && [ "$quc_hx_tsp_raw" = "$ec_val" ]; then
+                quc_hex_out=$quc_hx_tsp
+                return 0
+            fi
+            quc_hx_tsp=$(quc_hex_encode "$ec_val")
+            quc_hx_tsp_raw=$ec_val
+            quc_hx_tsp_set=1
+            quc_hex_out=$quc_hx_tsp
+            ;;
+        phase)
+            if [ "${quc_hx_phase_set:-}" = 1 ] && [ "$quc_hx_phase_raw" = "$ec_val" ]; then
+                quc_hex_out=$quc_hx_phase
+                return 0
+            fi
+            quc_hx_phase=$(quc_hex_encode "$ec_val")
+            quc_hx_phase_raw=$ec_val
+            quc_hx_phase_set=1
+            quc_hex_out=$quc_hx_phase
+            ;;
+        *)
+            quc_hex_out=$(quc_hex_encode "$ec_val")
+            ;;
+    esac
 }
 
 quc_save_state() {
     st_file=$quc_job_dir/state
     st_tmp=$quc_job_dir/state.tmp.$$
-    src_hex=$(quc_hex_encode "$quc_source")
-    tgt_hex=$(quc_hex_encode "$quc_target")
-    ssp_hex=$(quc_hex_encode "$quc_source_spec")
-    tsp_hex=$(quc_hex_encode "$quc_target_spec")
-    php_hex=$(quc_hex_encode "$quc_phase_path")
+    quc_encode_cached source "$quc_source"
+    src_hex=$quc_hex_out
+    quc_encode_cached target "$quc_target"
+    tgt_hex=$quc_hex_out
+    quc_encode_cached source_spec "$quc_source_spec"
+    ssp_hex=$quc_hex_out
+    quc_encode_cached target_spec "$quc_target_spec"
+    tsp_hex=$quc_hex_out
+    quc_encode_cached phase "$quc_phase_path"
+    php_hex=$quc_hex_out
     {
         printf 'version=%s\n' "$quc_version"
         printf 'job_id=%s\n' "$quc_job_id"
@@ -452,6 +624,7 @@ quc_save_state() {
         printf 'sync_unconfirmed=%s\n' "$quc_sync_unconfirmed"
         printf 'sync_status=%s\n' "$quc_sync_status"
         printf 'sync_mode=%s\n' "$quc_sync_mode"
+        printf 'profile=%s\n' "${quc_profile:-gentle}"
         printf 'fatal_kind=%s\n' "$quc_fatal_kind"
     } > "$st_tmp" || return 1
     "$quc_bin_mv" -f -- "$st_tmp" "$st_file"
@@ -487,12 +660,16 @@ quc_load_state() {
             source_uuid) quc_source_uuid=$val ;;
             target_uuid) quc_target_uuid=$val ;;
             source_spec_hex)
-                quc_decode_hex_var "$val" || return 1
-                quc_source_spec=$quc_decoded
+                if [ -n "$val" ]; then
+                    quc_decode_hex_var "$val" || return 1
+                    quc_source_spec=$quc_decoded
+                fi
                 ;;
             target_spec_hex)
-                quc_decode_hex_var "$val" || return 1
-                quc_target_spec=$quc_decoded
+                if [ -n "$val" ]; then
+                    quc_decode_hex_var "$val" || return 1
+                    quc_target_spec=$quc_decoded
+                fi
                 ;;
             source_fssize) quc_source_fssize=$(quc_norm_uint "$val") ;;
             target_fssize) quc_target_fssize=$(quc_norm_uint "$val") ;;
@@ -529,6 +706,7 @@ quc_load_state() {
             sync_unconfirmed) quc_sync_unconfirmed=$(quc_norm_uint "$val") ;;
             sync_status) quc_sync_status=$val ;;
             sync_mode) quc_sync_mode=$val ;;
+            profile) quc_profile=$val ;;
             fatal_kind) quc_fatal_kind=$val ;;
         esac
     done < "$file"
@@ -539,6 +717,10 @@ quc_load_state() {
     case $quc_sync_mode in
         data|file|none) ;;
         *) quc_sync_mode= ;;
+    esac
+    case $quc_profile in
+        gentle) ;;
+        *) quc_profile=gentle ;;
     esac
     if [ "$quc_sync_unconfirmed" = 1 ]; then
         quc_sync_status=unconfirmed
@@ -1396,9 +1578,9 @@ quc_sync_cmd() {
 quc_probe_copy_tools() {
     quc_cp_sparse=0
     quc_sync_mode=none
-    in=$quc_job_dir/probe-in
-    out=$quc_job_dir/probe-out
-    sp_err=$quc_job_dir/sync-probe.err
+    in=$(quc_scratch_file probe-in)
+    out=$(quc_scratch_file probe-out)
+    sp_err=$(quc_scratch_file sync-probe.err)
     printf 'x' > "$in" || return 1
     if "$quc_bin_cp" --sparse=auto -- "$in" "$out" >/dev/null 2>&1; then
         quc_cp_sparse=1
@@ -1431,7 +1613,7 @@ quc_set_phase() {
 quc_transfer_file() {
     tf_src=$1
     tf_dst=$2
-    tf_err=$quc_job_dir/transfer.err
+    tf_err=$(quc_scratch_file transfer.err)
     : > "$tf_err"
     if [ "$quc_cp_sparse" = 1 ]; then
         "$quc_bin_cp" --sparse=auto -- "$tf_src" "$tf_dst" 2>"$tf_err" &
@@ -1497,7 +1679,7 @@ quc_ensure_dir() {
             quc_error="на пути каталога уже есть файл: $(quc_display_path "$ed_dest")"
             return 2
         fi
-        if ! "$quc_bin_mkdir" -- "$ed_dest" 2>>"$quc_job_dir/transfer.err"; then
+        if ! "$quc_bin_mkdir" -- "$ed_dest" 2>>"$(quc_scratch_file transfer.err)"; then
             if ! quc_identity_still; then
                 return 10
             fi
@@ -1593,14 +1775,14 @@ quc_copy_regular() {
             if [ "$cr_rc" -eq 20 ] || [ "${quc_stop_requested:-0}" = 1 ]; then
                 return 20
             fi
-            if [ -f "$quc_job_dir/transfer.err" ] && "$quc_bin_grep" -q -e 'No space left' -e 'Disk quota exceeded' "$quc_job_dir/transfer.err"; then
+            if [ -f "$(quc_scratch_file transfer.err)" ] && "$quc_bin_grep" -q -e 'No space left' -e 'Disk quota exceeded' "$(quc_scratch_file transfer.err)"; then
                 quc_error="на назначении закончилось место"
                 return 10
             fi
             if ! quc_identity_still; then
                 return 10
             fi
-            if [ -f "$quc_job_dir/transfer.err" ] && "$quc_bin_grep" -q -e 'Permission denied' -e 'Operation not permitted' -e 'No such file' "$quc_job_dir/transfer.err"; then
+            if [ -f "$(quc_scratch_file transfer.err)" ] && "$quc_bin_grep" -q -e 'Permission denied' -e 'Operation not permitted' -e 'No such file' "$(quc_scratch_file transfer.err)"; then
                 quc_error="не удалось прочитать или записать файл"
                 return 2
             fi
@@ -1709,7 +1891,7 @@ quc_copy_link() {
     esac
     tmp=$("$quc_bin_dirname" -- "$dst")/$QUC_PARTIAL_PREFIX$$.link
     "$quc_bin_rm" -f -- "$tmp" 2>/dev/null || true
-    if ! "$quc_bin_ln" -s -- "$target" "$tmp" 2>"$quc_job_dir/transfer.err"; then
+    if ! "$quc_bin_ln" -s -- "$target" "$tmp" 2>"$(quc_scratch_file transfer.err)"; then
         quc_error="файловая система назначения не поддерживает символьные ссылки"
         quc_log ERROR "path=$(quc_display_path "$rel") $quc_error"
         return 4
@@ -1871,9 +2053,9 @@ quc_handle_path() {
 quc_write_plan() {
     out=$1
     root=$2
-    nul=$quc_job_dir/plan.0
+    nul=$(quc_scratch_file plan.0)
     if "$quc_bin_find" "$root" -xdev -print0 -quit >/dev/null 2>&1; then
-        "$quc_bin_find" "$root" -xdev -print0 > "$nul" 2>"$quc_job_dir/transfer.err" &
+        "$quc_bin_find" "$root" -xdev -print0 > "$nul" 2>"$(quc_scratch_file transfer.err)" &
         quc_wait_pid "$!"
         wp_rc=$?
         if [ "$wp_rc" -ne 0 ]; then
@@ -1966,7 +2148,7 @@ quc_reconcile_stopped() {
 }
 
 quc_reconcile_tree() {
-    now=$quc_job_dir/now.hex
+    now=$(quc_scratch_file now.hex)
     quc_write_plan "$now" "$quc_source"
     rr_rc=$?
     if [ "$rr_rc" -ne 0 ]; then
@@ -1976,16 +2158,16 @@ quc_reconcile_tree() {
         quc_error="не удалось повторно прочитать источник"
         return 10
     fi
-    new=$quc_job_dir/new.hex
-    gone=$quc_job_dir/gone.hex
-    if ! "$quc_bin_awk" 'NR == FNR { a[$0] = 1; next } !($0 in a) && NF { print }' "$quc_job_dir/plan.hex" "$now" > "$new"; then
+    new=$(quc_scratch_file new.hex)
+    gone=$(quc_scratch_file gone.hex)
+    if ! "$quc_bin_awk" 'NR == FNR { a[$0] = 1; next } !($0 in a) && NF { print }' "$(quc_scratch_file plan.hex)" "$now" > "$new"; then
         if quc_reconcile_stopped; then
             return 20
         fi
         quc_error="не удалось сравнить список файлов"
         return 1
     fi
-    if ! "$quc_bin_awk" 'NR == FNR { a[$0] = 1; next } !($0 in a) && NF { print }' "$now" "$quc_job_dir/plan.hex" > "$gone"; then
+    if ! "$quc_bin_awk" 'NR == FNR { a[$0] = 1; next } !($0 in a) && NF { print }' "$now" "$(quc_scratch_file plan.hex)" > "$gone"; then
         if quc_reconcile_stopped; then
             return 20
         fi
@@ -2007,14 +2189,14 @@ quc_reconcile_tree() {
             fi
             return 10
         fi
-        if ! "$quc_bin_awk" 'NR == FNR { a[$0] = 1; next } !($0 in a) && NF { print }' "$quc_job_dir/plan.hex" "$now" > "$new"; then
+        if ! "$quc_bin_awk" 'NR == FNR { a[$0] = 1; next } !($0 in a) && NF { print }' "$(quc_scratch_file plan.hex)" "$now" > "$new"; then
             if quc_reconcile_stopped; then
                 return 20
             fi
             quc_error="не удалось сравнить список файлов"
             return 1
         fi
-        cat "$quc_job_dir/plan.hex" "$quc_job_dir/extra.hex" 2>/dev/null > "$quc_job_dir/plan2.hex" || true
+        cat "$(quc_scratch_file plan.hex)" "$(quc_scratch_file extra.hex)" 2>/dev/null > "$(quc_scratch_file plan2.hex)" || true
     fi
     if [ -s "$new" ] || [ -s "$gone" ]; then
         quc_tree_changed=1
@@ -2044,7 +2226,7 @@ quc_cleanup_partials() {
 }
 
 quc_dest_unexpected() {
-    du_list=$quc_job_dir/dest-scan.hex
+    du_list=$(quc_scratch_file dest-scan.hex)
     quc_write_plan "$du_list" "$quc_target"
     du_rc=$?
     if [ "$du_rc" -ne 0 ]; then
@@ -2111,6 +2293,7 @@ quc_finalize() {
         quc_log INFO "error=$(quc_one_line "$quc_error")"
     fi
     quc_release_lock
+    quc_drop_scratch
 }
 
 quc_on_exit() {
@@ -2129,7 +2312,7 @@ quc_on_exit() {
 quc_flag_nested_mounts() {
     root=$1
     role=$2
-    seen=$quc_job_dir/nested.seen
+    seen=$(quc_scratch_file nested.seen)
     : > "$seen" || return 0
     if [ ! -r /proc/self/mountinfo ]; then
         return 0
@@ -2187,6 +2370,7 @@ quc_worker_main() {
         quc_finalized=1
         exit 1
     fi
+    quc_open_run_dir
     if ! quc_read_owner; then
         quc_error="нет блокировки задания"
         quc_finalize FAILED "$quc_error"
@@ -2211,7 +2395,7 @@ quc_worker_main() {
     printf '%s\n' "$$" > "$quc_job_dir/ready"
     quc_apply_niceness
     quc_probe_copy_tools || true
-    quc_log INFO "worker pid=$$ mode=$quc_run_mode sparse=$quc_cp_sparse sync_mode=$quc_sync_mode"
+    quc_log INFO "worker pid=$$ mode=$quc_run_mode sparse=$quc_cp_sparse sync_mode=$quc_sync_mode profile=${quc_profile:-gentle}"
     if [ "$quc_run_mode" = fresh ]; then
         if ! quc_validate_pair "$quc_source" "$quc_target" fresh; then
             quc_error=$(printf '%s\n' "$quc_problems" | "$quc_bin_awk" 'NR == 1 { print; exit }')
@@ -2250,13 +2434,13 @@ quc_worker_main() {
         exit 1
     fi
     quc_set_phase planning ''
-    quc_write_plan "$quc_job_dir/plan.hex" "$quc_source"
+    quc_write_plan "$(quc_scratch_file plan.hex)" "$quc_source"
     rc=$?
     if [ "$rc" -ne 0 ]; then
         quc_finalize_rc "$rc" "не удалось составить список файлов источника"
         exit 1
     fi
-    total=$("$quc_bin_awk" 'NF { c++ } END { printf "%.0f", c + 0 }' "$quc_job_dir/plan.hex")
+    total=$("$quc_bin_awk" 'NF { c++ } END { printf "%.0f", c + 0 }' "$(quc_scratch_file plan.hex)")
     if quc_cmp_num "$total" 0 gt; then
         total=$(quc_add_bytes "$total" -1)
     fi
@@ -2268,7 +2452,7 @@ quc_worker_main() {
     quc_bytes_done=0
     quc_flag_nested_mounts "$quc_source" "источник" || true
     quc_save_state || true
-    quc_copy_list "$quc_job_dir/plan.hex"
+    quc_copy_list "$(quc_scratch_file plan.hex)"
     rc=$?
     if [ "$rc" -ne 0 ]; then
         quc_finalize_rc "$rc" "${quc_error:-копирование прервано ошибкой}"
@@ -2367,29 +2551,65 @@ quc_current_id() {
 quc_cmd_help() {
     cat <<'EOF'
 Quiet USB Copy копирует один уже смонтированный накопитель на другой.
-Программа не запрашивает пароль и при запуске копирования ничего не показывает.
+Пароль не нужен. Окна, звук и уведомления программа не создаёт.
 
-Команды:
-  sh quiet_usb_copy.sh start ИСТОЧНИК НАЗНАЧЕНИЕ
-  sh quiet_usb_copy.sh start --verify ИСТОЧНИК НАЗНАЧЕНИЕ
-  sh quiet_usb_copy.sh check ИСТОЧНИК НАЗНАЧЕНИЕ
+В терминале
+
+  sh quiet_usb_copy.sh
+
+Один экран: источник, назначение, проверка, затем 1, 2 или 0.
+Направление само не угадывается. После 1 терминал свободен.
+Вопрос во время копирования не задаётся. Если списка нет, введите
+два абсолютных пути. Вне терминала меню не открывается.
+
   sh quiet_usb_copy.sh status
-  sh quiet_usb_copy.sh report
   sh quiet_usb_copy.sh stop
   sh quiet_usb_copy.sh resume
-  sh quiet_usb_copy.sh verify
   sh quiet_usb_copy.sh help
 
-Назначение при обычном запуске должно быть пустым. Прерванное задание
-продолжает resume. Контрольную сумму считает verify или start --verify.
-SUCCESS, контрольная сумма и успешный sync не заменяют штатное безопасное
-извлечение накопителя средствами операционной системы.
+Для автоматизации
+
+  sh quiet_usb_copy.sh start ИСТОЧНИК НАЗНАЧЕНИЕ
+  sh quiet_usb_copy.sh start --profile gentle --verify ИСТОЧНИК НАЗНАЧЕНИЕ
+  sh quiet_usb_copy.sh check ИСТОЧНИК НАЗНАЧЕНИЕ
+  sh quiet_usb_copy.sh status --machine
+  sh quiet_usb_copy.sh report
+  sh quiet_usb_copy.sh report --verbose
+  sh quiet_usb_copy.sh verify
+  sh quiet_usb_copy.sh doctor
+  sh quiet_usb_copy.sh selftest
+  sh quiet_usb_copy.sh cleanup
+  sh quiet_usb_copy.sh cleanup --dry-run
+  sh quiet_usb_copy.sh version
+
+status в терминале — короткий русский итог. Для программ: --machine.
+Диагностика: report --verbose. Профиль gentle снижает приоритет только
+этого копирования и не обещает отсутствия задержек флешки.
+
+Назначение при обычном запуске должно быть пустым. resume продолжает
+прерванное задание. Успешные копирование, контрольная сумма и sync не
+заменяют штатное безопасное извлечение средствами операционной системы.
+
 Пути с дефисом в начале указывайте после -- :
   sh quiet_usb_copy.sh start -- --источник --назначение
 
-Служебные файлы:
+Коды выхода: 0 команда принята, 1 отказ или сбой операции,
+2 неверные аргументы, 70 нет программ или служебного каталога.
+Строки error_code=: E_OK, E_FAIL, E_USAGE, E_ENV, E_REJECT, E_NOJOB.
+
+Постоянные данные восстановления:
   ${XDG_STATE_HOME:-$HOME/.local/state}/quiet-usb-copy/
+Временные списки, если каталог доступен:
+  ${XDG_RUNTIME_DIR}/quiet-usb-copy/
+На флешках файлы программы не создаются. cleanup удаляет только свои
+завершённые служебные данные. --dry-run только показывает список.
+Выполняющееся задание не удаляется.
 EOF
+}
+
+quc_cmd_version() {
+    printf 'quiet-usb-copy %s\n' "$QUC_VERSION"
+    printf 'build %s\n' "$QUC_BUILD"
 }
 
 quc_cmd_check() {
@@ -2411,6 +2631,7 @@ quc_cmd_check() {
             done
         fi
         printf '%s\n' "check_result=REJECT"
+        printf '%s\n' "error_code=E_REJECT"
         return 1
     fi
     printf '%s\n' "Проверка: можно запускать копирование."
@@ -2427,6 +2648,7 @@ quc_cmd_check() {
         done
     fi
     printf '%s\n' "check_result=OK"
+    printf '%s\n' "error_code=E_OK"
     return 0
 }
 
@@ -2459,6 +2681,10 @@ quc_begin_job() {
     quc_sync_unconfirmed=0
     quc_sync_status=unconfirmed
     quc_sync_mode=
+    case ${quc_profile:-} in
+        gentle) ;;
+        *) quc_profile=gentle ;;
+    esac
     quc_save_state || return 1
     if [ "$publish" = yes ]; then
         printf '%s\n' "$quc_job_id" > "$quc_current" || return 1
@@ -2472,9 +2698,20 @@ quc_cmd_start() {
         exit 70
     fi
     verify=0
+    quc_profile=gentle
     while [ "$#" -gt 0 ]; do
         case $1 in
             --verify) verify=1; shift ;;
+            --profile)
+                shift
+                case ${1:-} in
+                    gentle) quc_profile=gentle; shift ;;
+                    *)
+                        quc_note_error "неизвестный профиль; доступен только gentle"
+                        exit 2
+                        ;;
+                esac
+                ;;
             --) shift; break ;;
             -*)
                 quc_note_error "неизвестный параметр запуска"
@@ -2518,6 +2755,11 @@ quc_cmd_start() {
         exit 1
     fi
     quc_verify_during=$verify
+    quc_launch_prepared
+}
+
+quc_launch_prepared() {
+    exec </dev/null >/dev/null 2>&1
     if ! quc_acquire_lock; then
         quc_note_error "уже выполняется другое задание"
         exit 1
@@ -2608,57 +2850,109 @@ quc_print_job() {
     if [ "$brief" -eq 0 ] && [ -f "$quc_log_file" ]; then
         printf '%s\n' "Журнал: $quc_log_file"
         printf '%s\n' "Последние ошибки:"
-        "$quc_bin_awk" '/ ERROR / { line = $0 } END { if (line != "") print line }' "$quc_log_file" > "$quc_job_dir/last-error-line" 2>/dev/null || true
         "$quc_bin_awk" '/ ERROR / { n = NR; lines[NR] = $0 } END { start = NR - 19; if (start < 1) start = 1; for (i = start; i <= NR; i++) if (lines[i] != "") print lines[i] }' "$quc_log_file" 2>/dev/null || true
     fi
 }
 
-quc_cmd_status() {
-    if ! quc_prepare_state; then
-        printf '%s\n' "Служебный каталог недоступен." >&2
-        return 70
-    fi
-    id=''
-    if [ "$#" -eq 1 ]; then
-        id=$1
-    else
-        id=$(quc_current_id || true)
-    fi
-    if [ -z "$id" ]; then
-        printf '%s\n' "Заданий пока нет."
-        if [ -f "$quc_last_error" ]; then
-            printf 'Последнее сообщение: %s\n' "$("$quc_bin_cat" "$quc_last_error")"
+quc_print_human() {
+    case $quc_copy_status in
+        RUNNING|STARTING) printf '%s\n' "Копирование выполняется." ;;
+        SUCCESS) printf '%s\n' "Копирование завершено." ;;
+        CANCELLED|INTERRUPTED) printf '%s\n' "Копирование остановлено." ;;
+        FAILED) printf '%s\n' "Копирование не выполнено." ;;
+        PARTIAL) printf '%s\n' "Копирование завершено частично." ;;
+        UNCERTAIN) printf '%s\n' "Результат копирования не подтверждён." ;;
+        *) printf 'Копирование: %s\n' "$(quc_status_text "$quc_copy_status")" ;;
+    esac
+    printf 'Файлы: %s из %s\n' "${quc_files_done:-0}" "${quc_files_total:-0}"
+    case ${quc_verify_status:-none} in
+        checksum|byte) printf '%s\n' "Проверка содержимого: завершена" ;;
+        size) printf '%s\n' "Проверка содержимого: сравнивались только размеры" ;;
+        failed) printf '%s\n' "Проверка содержимого: найдены отличия" ;;
+        uncertain) printf '%s\n' "Проверка содержимого: источник менялся" ;;
+        *) printf '%s\n' "Проверка содержимого: не выполнялась" ;;
+    esac
+    case ${quc_sync_status:-unconfirmed} in
+        command_ok)
+            printf '%s\n' "Синхронизация: команда sync завершилась без ошибки. Это не разрешение извлекать накопитель."
+            ;;
+        *)
+            printf '%s\n' "Синхронизация: сброс данных на носитель не подтверждён."
+            ;;
+    esac
+    printf '%s\n' "Для извлечения используйте средства ОС."
+    case ${quc_profile:-gentle} in
+        gentle)
+            printf '%s\n' "Режим: бережный. Задержки самой флешки возможны."
+            ;;
+        *)
+            printf 'Режим: %s\n' "$quc_profile"
+            ;;
+    esac
+    case $quc_copy_status in
+        PARTIAL|FAILED|UNCERTAIN)
+            if [ -n "${quc_error:-}" ]; then
+                printf 'Причина: %s\n' "$(quc_one_line "$quc_error")"
+            else
+                case $quc_copy_status in
+                    PARTIAL) printf '%s\n' "Причина: часть объектов не скопирована." ;;
+                    FAILED) printf '%s\n' "Причина: копирование не удалось." ;;
+                    *) printf '%s\n' "Причина: результат не подтверждён." ;;
+                esac
+            fi
+            printf '%s\n' "Подробнее: report"
+            ;;
+    esac
+}
+
+quc_parse_view_args() {
+    quc_view_mode=
+    quc_view_verbose=0
+    quc_view_id=
+    while [ "$#" -gt 0 ]; do
+        case $1 in
+            --machine) quc_view_mode=machine ;;
+            --human) quc_view_mode=human ;;
+            --verbose) quc_view_verbose=1 ;;
+            --)
+                shift
+                break
+                ;;
+            -*)
+                return 2
+                ;;
+            *)
+                if [ -n "$quc_view_id" ]; then
+                    return 2
+                fi
+                quc_view_id=$1
+                ;;
+        esac
+        shift
+    done
+    while [ "$#" -gt 0 ]; do
+        case $1 in
+            -*) return 2 ;;
+            *)
+                if [ -n "$quc_view_id" ]; then
+                    return 2
+                fi
+                quc_view_id=$1
+                ;;
+        esac
+        shift
+    done
+    if [ -z "$quc_view_mode" ]; then
+        if [ -t 1 ]; then
+            quc_view_mode=human
+        else
+            quc_view_mode=machine
         fi
-        return 1
-    fi
-    if ! quc_open_job "$id"; then
-        printf '%s\n' "Задание не найдено." >&2
-        return 1
-    fi
-    quc_print_job 1
-    if [ -f "$quc_last_error" ] && [ "$quc_copy_status" = RUNNING ]; then
-        printf 'Последнее сообщение: %s\n' "$("$quc_bin_cat" "$quc_last_error")"
     fi
     return 0
 }
 
-quc_cmd_report() {
-    if ! quc_prepare_state; then
-        printf '%s\n' "Служебный каталог недоступен." >&2
-        return 70
-    fi
-    id=$(quc_current_id || true)
-    if [ "$#" -eq 1 ]; then
-        id=$1
-    fi
-    if [ -z "$id" ] || ! quc_open_job "$id"; then
-        printf '%s\n' "Отчёта нет: задание не найдено."
-        if [ -f "$quc_last_error" ]; then
-            printf 'Последнее сообщение: %s\n' "$("$quc_bin_cat" "$quc_last_error")"
-        fi
-        return 1
-    fi
-    quc_print_job 0
+quc_print_report_extra() {
     if [ -n "$quc_started" ]; then
         printf 'Начало: %s\n' "$quc_started"
     fi
@@ -2670,6 +2964,89 @@ quc_cmd_report() {
         printf 'Длительность: %s с\n' "$dur"
     fi
     printf '%s\n' "Файловые системы: ${quc_source_fs:-?} -> ${quc_target_fs:-?}"
+    printf 'profile=%s\n' "${quc_profile:-gentle}"
+}
+
+quc_render_view() {
+    brief=$1
+    if [ "$quc_view_mode" = human ] && [ "$quc_view_verbose" = 1 ]; then
+        quc_print_human
+        printf '\n%s\n' "Диагностика:"
+        quc_print_job 0
+        quc_print_report_extra
+        return 0
+    fi
+    if [ "$quc_view_mode" = human ]; then
+        quc_print_human
+        return 0
+    fi
+    if [ "$quc_view_verbose" = 1 ] || [ "$brief" -eq 0 ]; then
+        quc_print_job 0
+        quc_print_report_extra
+        return 0
+    fi
+    quc_print_job 1
+}
+
+quc_cmd_status() {
+    if ! quc_prepare_state; then
+        printf '%s\n' "Служебный каталог недоступен." >&2
+        printf '%s\n' "error_code=E_ENV" >&2
+        return 70
+    fi
+    if ! quc_parse_view_args "$@"; then
+        printf '%s\n' "Непонятные аргументы status. См. help." >&2
+        printf '%s\n' "error_code=E_USAGE" >&2
+        return 2
+    fi
+    id=$quc_view_id
+    if [ -z "$id" ]; then
+        id=$(quc_current_id || true)
+    fi
+    if [ -z "$id" ]; then
+        printf '%s\n' "Заданий пока нет."
+        if [ -f "$quc_last_error" ]; then
+            printf 'Последнее сообщение: %s\n' "$("$quc_bin_cat" "$quc_last_error")"
+        fi
+        printf '%s\n' "error_code=E_NOJOB"
+        return 1
+    fi
+    if ! quc_open_job "$id"; then
+        printf '%s\n' "Задание не найдено." >&2
+        printf '%s\n' "error_code=E_NOJOB" >&2
+        return 1
+    fi
+    quc_render_view 1
+    if [ -f "$quc_last_error" ] && [ "$quc_copy_status" = RUNNING ]; then
+        printf 'Последнее сообщение: %s\n' "$("$quc_bin_cat" "$quc_last_error")"
+    fi
+    return 0
+}
+
+quc_cmd_report() {
+    if ! quc_prepare_state; then
+        printf '%s\n' "Служебный каталог недоступен." >&2
+        printf '%s\n' "error_code=E_ENV" >&2
+        return 70
+    fi
+    if ! quc_parse_view_args "$@"; then
+        printf '%s\n' "Непонятные аргументы report. См. help." >&2
+        printf '%s\n' "error_code=E_USAGE" >&2
+        return 2
+    fi
+    id=$quc_view_id
+    if [ -z "$id" ]; then
+        id=$(quc_current_id || true)
+    fi
+    if [ -z "$id" ] || ! quc_open_job "$id"; then
+        printf '%s\n' "Отчёта нет: задание не найдено."
+        if [ -f "$quc_last_error" ]; then
+            printf 'Последнее сообщение: %s\n' "$("$quc_bin_cat" "$quc_last_error")"
+        fi
+        printf '%s\n' "error_code=E_NOJOB"
+        return 1
+    fi
+    quc_render_view 0
     return 0
 }
 
@@ -2781,8 +3158,10 @@ quc_cmd_resume() {
     fi
     # Старый stop-requested не должен обрывать новую проверку назначения.
     "$quc_bin_rm" -f -- "$quc_job_dir/stop-requested" 2>/dev/null || true
+    quc_open_run_dir
     bad=$(quc_dest_unexpected)
     du_rc=$?
+    quc_drop_scratch
     if [ "$du_rc" -ne 0 ]; then
         quc_error="не удалось проверить посторонние объекты назначения"
         quc_note_error "$quc_error"
@@ -2856,8 +3235,10 @@ quc_cmd_verify() {
     quc_verify_tool=$tool
     bad=0
     uncertain=0
-    plan=$quc_job_dir/verify.hex
+    quc_open_run_dir
+    plan=$(quc_scratch_file verify.hex)
     if ! quc_write_plan "$plan" "$quc_source"; then
+        quc_drop_scratch
         printf '%s\n' "Не удалось прочитать источник."
         return 1
     fi
@@ -2930,6 +3311,7 @@ quc_cmd_verify() {
                 ;;
         esac
     done < "$plan"
+    quc_drop_scratch
     if [ "$uncertain" -eq 1 ]; then
         quc_verify_status=uncertain
         quc_save_state || true
@@ -2974,10 +3356,845 @@ quc_cmd_worker() {
     quc_worker_main "$1"
 }
 
+quc_answer_is_yes() {
+    case ${1:-} in
+        да) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+quc_volume_candidate() {
+    vc_src=$1
+    vc_fs=$2
+    vc_mp=$3
+    vc_rem=$4
+    case $vc_src in
+        /dev/*) ;;
+        *) return 1 ;;
+    esac
+    case $vc_mp in
+        ''|/) return 1 ;;
+    esac
+    case $vc_fs in
+        ''|autofs|proc|sysfs|tmpfs|devtmpfs|devpts|cgroup|cgroup2|overlay|squashfs|nfs|nfs4|cifs|smb3|fuse.portal|fusectl|debugfs|tracefs|securityfs|bpf|configfs|pstore|mqueue|hugetlbfs|ramfs|binfmt_misc|nsfs|rpc_pipefs)
+            return 1
+            ;;
+        fuse.*) return 1 ;;
+    esac
+    if quc_is_system_path "$vc_mp"; then
+        return 1
+    fi
+    case $vc_rem in
+        yes) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+quc_volume_label() {
+    vl_spec=$1
+    vl_mp=$2
+    vl_label=
+    if [ -n "${quc_bin_findmnt:-}" ]; then
+        vl_label=$("$quc_bin_findmnt" -n -o LABEL -T "$vl_mp" 2>/dev/null | "$quc_bin_awk" 'NR == 1 { print; exit }') || vl_label=
+    fi
+    case $vl_label in
+        */*) vl_label= ;;
+    esac
+    if [ -n "$vl_label" ]; then
+        printf '%s\n' "$vl_label"
+        return 0
+    fi
+    if [ -d /dev/disk/by-label ] && [ ! -L /dev/disk/by-label ]; then
+        vl_want=$("$quc_bin_readlink" -f -- "$vl_spec" 2>/dev/null || true)
+        if [ -n "$vl_want" ]; then
+            vl_found=$("$quc_bin_find" /dev/disk/by-label -mindepth 1 -maxdepth 1 -print 2>/dev/null | while IFS= read -r vl_link || [ -n "$vl_link" ]; do
+                [ -n "$vl_link" ] || continue
+                vl_real=$("$quc_bin_readlink" -f -- "$vl_link" 2>/dev/null || true)
+                if [ "$vl_real" = "$vl_want" ]; then
+                    "$quc_bin_basename" -- "$vl_link"
+                    break
+                fi
+            done)
+            if [ -n "$vl_found" ]; then
+                printf '%s\n' "$vl_found"
+                return 0
+            fi
+        fi
+    fi
+    printf '\n'
+}
+
+quc_collect_volumes() {
+    out=$1
+    seen=$1.seen
+    : > "$out" || return 1
+    : > "$seen" || return 1
+    quc_vol_shown=0
+    quc_vol_skipped=0
+    root_dev=$(quc_dev_of / || true)
+    # Тестовый список заменяет живой обход: меню не должно выбрать настоящий носитель.
+    if [ -z "${QUC_FAKE_VOLUMES:-}" ] && [ -r /proc/self/mountinfo ]; then
+        while IFS= read -r cv_line || [ -n "$cv_line" ]; do
+            [ -n "$cv_line" ] || continue
+            cv_f5=$(printf '%s\n' "$cv_line" | "$quc_bin_awk" '{ print $5 }')
+            cv_mp=$(quc_unescape_field "$cv_f5" && printf X) || continue
+            cv_mp=${cv_mp%X}
+            cv_parsed=$(printf '%s\n' "$cv_line" | "$quc_bin_awk" '{
+                fst = ""
+                src = ""
+                for (i = 1; i <= NF; i++) {
+                    if ($i == "-") {
+                        fst = $(i + 1)
+                        src = $(i + 2)
+                        break
+                    }
+                }
+                printf "%s\t%s", fst, src
+            }')
+            cv_fs=${cv_parsed%%	*}
+            cv_raw=${cv_parsed#*	}
+            cv_src=$(quc_unescape_field "$cv_raw" && printf X) || cv_src=
+            cv_src=${cv_src%X}
+            if "$quc_bin_grep" -F -x -e "$cv_mp" -- "$seen" >/dev/null 2>&1; then
+                continue
+            fi
+            printf '%s\n' "$cv_mp" >> "$seen" || true
+            cv_disk=$(quc_disk_name "$cv_src" 0) || cv_disk=
+            cv_rem=unknown
+            if [ -n "$cv_disk" ] && [ -f "/sys/class/block/$cv_disk/removable" ]; then
+                cv_flag=$("$quc_bin_awk" 'NR == 1 { print; exit }' "/sys/class/block/$cv_disk/removable" 2>/dev/null || true)
+                case $cv_flag in
+                    1) cv_rem=yes ;;
+                    0) cv_rem=no ;;
+                esac
+            fi
+            if ! quc_volume_candidate "$cv_src" "$cv_fs" "$cv_mp" "$cv_rem"; then
+                case $cv_src in
+                    /dev/*) quc_vol_skipped=$(quc_add_bytes "$quc_vol_skipped" 1) ;;
+                esac
+                continue
+            fi
+            cv_dev=$(quc_dev_of "$cv_mp" || true)
+            if [ -n "$root_dev" ] && [ -n "$cv_dev" ] && [ "$cv_dev" = "$root_dev" ]; then
+                quc_vol_skipped=$(quc_add_bytes "$quc_vol_skipped" 1)
+                continue
+            fi
+            cv_label=$(quc_volume_label "$cv_src" "$cv_mp" || true)
+            cv_bytes=$(quc_fs_bytes "$cv_mp" || printf '0')
+            cv_free=$(quc_free_bytes "$cv_mp" || printf '')
+            printf '%s\t%s\t%s\t%s\t%s\tyes\t%s\n' \
+                "$(quc_hex_encode "$cv_mp")" \
+                "$cv_fs" \
+                "$(quc_hex_encode "$cv_src")" \
+                "$(quc_hex_encode "$cv_label")" \
+                "$cv_bytes" \
+                "$cv_free" >> "$out" || return 1
+            quc_vol_shown=$(quc_add_bytes "$quc_vol_shown" 1)
+        done < /proc/self/mountinfo
+    fi
+    if [ -n "${QUC_FAKE_VOLUMES:-}" ] && [ -f "$QUC_FAKE_VOLUMES" ] && [ ! -L "$QUC_FAKE_VOLUMES" ]; then
+        while IFS= read -r fv_line || [ -n "$fv_line" ]; do
+            [ -n "$fv_line" ] || continue
+            fv_ok=$(printf '%s\n' "$fv_line" | "$quc_bin_awk" -F '\t' 'NF >= 6 && $6 == "yes" { print "yes"; exit }')
+            [ "$fv_ok" = yes ] || continue
+            printf '%s\n' "$fv_line" >> "$out" || return 1
+            quc_vol_shown=$(quc_add_bytes "$quc_vol_shown" 1)
+        done < "$QUC_FAKE_VOLUMES"
+    fi
+    "$quc_bin_rm" -f -- "$seen" 2>/dev/null || true
+    return 0
+}
+
+quc_volume_fields() {
+    vf_line=$1
+    quc_vf_mp=
+    quc_vf_fs=
+    quc_vf_label=
+    quc_vf_bytes=0
+    quc_vf_free=
+    vf_sep=$(printf '\036')
+    vf_parsed=$(printf '%s\n' "$vf_line" | "$quc_bin_awk" -F '\t' -v sep="$vf_sep" 'NR == 1 {
+        printf "%s%s%s%s%s%s%s%s%s", $1, sep, $2, sep, $4, sep, $5, sep, $7
+        exit
+    }')
+    quc_vf_mp_hex=${vf_parsed%%"$vf_sep"*}
+    vf_rest=${vf_parsed#*"$vf_sep"}
+    quc_vf_fs=${vf_rest%%"$vf_sep"*}
+    vf_rest=${vf_rest#*"$vf_sep"}
+    quc_vf_label_hex=${vf_rest%%"$vf_sep"*}
+    vf_rest=${vf_rest#*"$vf_sep"}
+    quc_vf_bytes=${vf_rest%%"$vf_sep"*}
+    quc_vf_free=${vf_rest#*"$vf_sep"}
+    quc_decode_hex_var "$quc_vf_mp_hex" || return 1
+    quc_vf_mp=$quc_decoded
+    quc_vf_label=
+    if [ -n "$quc_vf_label_hex" ] && quc_decode_hex_var "$quc_vf_label_hex"; then
+        quc_vf_label=$quc_decoded
+    fi
+    if [ -z "$quc_vf_label" ]; then
+        quc_vf_label='без метки'
+    fi
+    return 0
+}
+
+quc_print_volumes() {
+    pv_file=$1
+    pv_n=0
+    while IFS= read -r pv_line || [ -n "$pv_line" ]; do
+        [ -n "$pv_line" ] || continue
+        pv_n=$(quc_add_bytes "$pv_n" 1)
+        quc_volume_fields "$pv_line" || continue
+        printf '%s. %s   USB · %s' "$pv_n" "$(quc_display_path "$quc_vf_label")" "$(quc_human_bytes "$quc_vf_bytes")"
+        if [ -n "$quc_vf_free" ]; then
+            printf ' · свободно %s' "$(quc_human_bytes "$quc_vf_free")"
+        fi
+        if [ -n "$quc_vf_fs" ]; then
+            printf ' · %s' "$(quc_display_path "$quc_vf_fs")"
+        fi
+        printf '\n'
+        printf '   %s\n' "$(quc_display_path "$quc_vf_mp")"
+    done < "$pv_file"
+}
+
+quc_volume_pick() {
+    vp_choice=$1
+    vp_file=$2
+    case $vp_choice in
+        /*)
+            printf '%s\n' "$vp_choice"
+            return 0
+            ;;
+    esac
+    quc_is_uint "$vp_choice" || return 1
+    if [ "$vp_choice" = 0 ]; then
+        return 1
+    fi
+    vp_hex=$("$quc_bin_awk" -F '\t' -v n="$vp_choice" 'NR == n { print $1; exit }' "$vp_file")
+    [ -n "$vp_hex" ] || return 1
+    quc_decode_hex_var "$vp_hex" || return 1
+    printf '%s\n' "$quc_decoded"
+}
+
+quc_fs_caution() {
+    case ${1:-} in
+        ext2|ext3|ext4|btrfs|xfs|tmpfs|f2fs|'')
+            return 0
+            ;;
+        vfat|msdos|fat|msdosfs)
+            printf '%s\n' "FAT: имена и файлы больше 4 ГиБ могут быть пропущены. Полный обход имён до подтверждения запуска не делается."
+            ;;
+        exfat)
+            printf '%s\n' "exFAT: часть имён может не сохраниться. Полный обход имён до подтверждения запуска не делается."
+            ;;
+        ntfs|ntfs3|fuseblk)
+            printf '%s\n' "NTFS: права Unix не сохраняются. Это не запрет запуска."
+            ;;
+        *)
+            printf 'Файловая система непроверенного типа (%s). Обычные файлы возможны. Особые ограничения не проверялись.\n' "$(quc_display_path "$1")"
+            ;;
+    esac
+}
+
+quc_note_pending_job() {
+    pn_id=$(quc_current_id || true)
+    [ -n "$pn_id" ] || return 0
+    pn_file=$quc_jobs_dir/$pn_id/state
+    [ -f "$pn_file" ] || return 0
+    pn_st=$("$quc_bin_awk" -F= '$1 == "copy_status" { print substr($0, index($0, "=") + 1); exit }' "$pn_file")
+    case $pn_st in
+        ''|SUCCESS) return 0 ;;
+        RUNNING|STARTING)
+            if quc_read_owner && quc_pid_is_worker "$quc_owner_pid" "$quc_owner_start" "$quc_jobs_dir/$quc_owner_job"; then
+                quc_add_problem "уже выполняется другое задание"
+                quc_preflight_ok=0
+                return 0
+            fi
+            quc_add_note "предыдущее задание $pn_id не завершено. Меню его не продолжает."
+            ;;
+        *)
+            quc_add_note "есть незавершённое задание $pn_id. Меню его не продолжает. Продолжение: resume."
+            ;;
+    esac
+}
+
+quc_label_for_path() {
+    lp_path=$1
+    lp_file=$2
+    lp_n=0
+    quc_lp_label='без метки'
+    quc_lp_n=
+    while IFS= read -r lp_line || [ -n "$lp_line" ]; do
+        [ -n "$lp_line" ] || continue
+        lp_n=$(quc_add_bytes "$lp_n" 1)
+        quc_volume_fields "$lp_line" || continue
+        if [ "$quc_vf_mp" = "$lp_path" ]; then
+            quc_lp_label=$quc_vf_label
+            quc_lp_n=$lp_n
+            return 0
+        fi
+    done < "$lp_file"
+    return 0
+}
+
+quc_menu_close() {
+    if [ -n "${quc_menu_file:-}" ]; then
+        "$quc_bin_rm" -f -- "$quc_menu_file" "$quc_menu_file.seen" 2>/dev/null || true
+    fi
+}
+
+quc_menu_cancel() {
+    quc_menu_close
+    printf '%s\n' "Копирование не запущено."
+    printf '%s\n' "error_code=E_OK"
+}
+
+quc_menu_read() {
+    quc_menu_answer=
+    if ! IFS= read -r quc_menu_answer; then
+        quc_menu_answer=
+        return 1
+    fi
+    quc_menu_answer=$(printf '%s' "$quc_menu_answer" | "$quc_bin_tr" -d '\r')
+    return 0
+}
+
+quc_menu_show_list() {
+    printf '%s\n' "Quiet USB Copy"
+    printf '\n'
+    if [ "${quc_vol_shown:-0}" = 0 ]; then
+        printf '%s\n' "Съёмных накопителей не найдено."
+        printf '%s\n' "Введите два абсолютных пути."
+    else
+        printf '%s\n' "Носители"
+        quc_print_volumes "$quc_menu_file"
+        if quc_cmp_num "${quc_vol_skipped:-0}" 0 gt; then
+            printf 'Не показаны блочные разделы: %s. В список входят только накопители с признаком съёмности 1.\n' "$quc_vol_skipped"
+        fi
+    fi
+    printf '\n'
+    printf '%s\n' "Направление само не выбирается."
+    printf '%s\n' "Режим: бережный"
+    printf '%s\n' "[0] Отмена"
+    printf '%s\n' "Источник — номер или путь:"
+}
+
+quc_print_side() {
+    ps_role=$1
+    ps_path=$2
+    ps_fs=$3
+    ps_bytes=$4
+    quc_label_for_path "$ps_path" "$quc_menu_file"
+    printf '%s\n' "$ps_role"
+    if [ -n "$quc_lp_n" ]; then
+        printf '%s. %s   USB' "$quc_lp_n" "$(quc_display_path "$quc_lp_label")"
+    else
+        printf '%s' "$(quc_display_path "$quc_lp_label")"
+    fi
+    if [ -n "$ps_bytes" ]; then
+        printf ' · %s' "$(quc_human_bytes "$ps_bytes")"
+    fi
+    ps_free=
+    if [ -d "$ps_path" ]; then
+        ps_free=$(quc_free_bytes "$ps_path" 2>/dev/null || true)
+    fi
+    if [ -n "$ps_free" ]; then
+        printf ' · свободно %s' "$(quc_human_bytes "$ps_free")"
+    fi
+    if [ -n "$ps_fs" ]; then
+        printf ' · %s' "$(quc_display_path "$ps_fs")"
+    fi
+    printf '\n'
+    printf '   %s\n' "$(quc_display_path "$ps_path")"
+}
+
+quc_menu_show_confirm() {
+    printf '\n%s\n' "Quiet USB Copy"
+    printf '\n'
+    quc_print_side "ИСТОЧНИК" "$quc_menu_src" "${quc_source_fs:-}" "${quc_source_fssize:-}"
+    printf '\n'
+    quc_print_side "НАЗНАЧЕНИЕ" "$quc_menu_dst" "${quc_target_fs:-}" "${quc_target_fssize:-}"
+    printf '\n'
+    quc_label_for_path "$quc_menu_src" "$quc_menu_file"
+    qm_src_name=$(quc_display_path "$quc_lp_label")
+    quc_label_for_path "$quc_menu_dst" "$quc_menu_file"
+    qm_dst_name=$(quc_display_path "$quc_lp_label")
+    printf '%s → %s\n' "$qm_src_name" "$qm_dst_name"
+    printf '\n'
+    if [ "$quc_preflight_ok" = 1 ]; then
+        printf '%s\n' "Проверка: готово"
+    else
+        printf '%s\n' "Проверка: запускать нельзя"
+    fi
+    if [ -n "$quc_problems" ]; then
+        printf '%s\n' "$quc_problems" | while IFS= read -r qm_line || [ -n "$qm_line" ]; do
+            [ -n "$qm_line" ] || continue
+            printf 'Причина: %s\n' "$qm_line"
+        done
+    fi
+    if [ -n "$quc_notes" ]; then
+        printf '%s\n' "$quc_notes" | while IFS= read -r qm_line || [ -n "$qm_line" ]; do
+            [ -n "$qm_line" ] || continue
+            printf 'Замечание: %s\n' "$qm_line"
+        done
+    fi
+    printf '%s\n' "Режим: бережный"
+    printf '\n'
+    if [ "$quc_preflight_ok" = 1 ]; then
+        printf '%s\n' "[1] Начать"
+    fi
+    printf '%s\n' "[2] Изменить выбор"
+    printf '%s\n' "[0] Отмена"
+    printf '%s\n' "Выбор:"
+}
+
+quc_cmd_interactive() {
+    if [ ! -t 0 ] || [ ! -t 1 ]; then
+        printf '%s\n' "Выбор накопителей открывается только в терминале без аргументов." >&2
+        printf '%s\n' "Команды: sh quiet_usb_copy.sh help" >&2
+        printf '%s\n' "error_code=E_USAGE" >&2
+        return 2
+    fi
+    if ! quc_prepare_state; then
+        printf '%s\n' "Служебный каталог недоступен." >&2
+        printf '%s\n' "error_code=E_ENV" >&2
+        return 70
+    fi
+    if quc_runtime_prepare; then
+        quc_menu_file=$quc_runtime_base/menu.$$
+    else
+        quc_menu_file=$quc_state_dir/menu.$$
+    fi
+    while :; do
+        if ! quc_collect_volumes "$quc_menu_file"; then
+            quc_menu_close
+            printf '%s\n' "Не удалось прочитать список носителей." >&2
+            printf '%s\n' "error_code=E_FAIL" >&2
+            return 1
+        fi
+        quc_menu_show_list
+        if ! quc_menu_read; then
+            quc_menu_cancel
+            return 0
+        fi
+        case $quc_menu_answer in
+            0)
+                quc_menu_cancel
+                return 0
+                ;;
+        esac
+        quc_menu_src=$(quc_volume_pick "$quc_menu_answer" "$quc_menu_file") || {
+            printf '%s\n' "Источник не выбран."
+            continue
+        }
+        printf '%s\n' "Назначение — номер или путь:"
+        if ! quc_menu_read; then
+            quc_menu_cancel
+            return 0
+        fi
+        case $quc_menu_answer in
+            0)
+                quc_menu_cancel
+                return 0
+                ;;
+        esac
+        quc_menu_dst=$(quc_volume_pick "$quc_menu_answer" "$quc_menu_file") || {
+            printf '%s\n' "Назначение не выбрано."
+            continue
+        }
+        quc_source_fs=
+        quc_target_fs=
+        quc_source_fssize=
+        quc_target_fssize=
+        if quc_validate_pair "$quc_menu_src" "$quc_menu_dst" fresh; then
+            quc_preflight_ok=1
+        else
+            quc_preflight_ok=0
+        fi
+        if [ -n "${quc_target_fs:-}" ]; then
+            qm_caut=$(quc_fs_caution "$quc_target_fs" || true)
+            if [ -n "$qm_caut" ]; then
+                quc_add_note "$qm_caut"
+            fi
+        fi
+        quc_note_pending_job
+        while :; do
+            quc_menu_show_confirm
+            if ! quc_menu_read; then
+                quc_menu_cancel
+                return 0
+            fi
+            case $quc_menu_answer in
+                0)
+                    quc_menu_cancel
+                    return 0
+                    ;;
+                2) break ;;
+                1)
+                    if [ "$quc_preflight_ok" != 1 ]; then
+                        printf '%s\n' "Запуск запрещён."
+                        continue
+                    fi
+                    if quc_read_owner && quc_pid_is_worker "$quc_owner_pid" "$quc_owner_start" "$quc_jobs_dir/$quc_owner_job"; then
+                        quc_add_problem "уже выполняется другое задание"
+                        quc_preflight_ok=0
+                        printf '%s\n' "Запуск запрещён."
+                        continue
+                    fi
+                    printf '%s\n' "Копирование запущено в фоне. Статус по запросу: sh quiet_usb_copy.sh status"
+                    quc_menu_close
+                    quc_verify_during=0
+                    quc_profile=gentle
+                    quc_launch_prepared
+                    ;;
+                *)
+                    printf '%s\n' "Нужно 1, 2 или 0."
+                    ;;
+            esac
+        done
+    done
+}
+quc_make_probe_dir() {
+    if quc_runtime_prepare; then
+        pd=$quc_runtime_base/probe.$$
+    elif [ -n "${quc_state_dir:-}" ] && [ -d "$quc_state_dir" ] && [ ! -L "$quc_state_dir" ]; then
+        pd=$quc_state_dir/probe.$$
+    else
+        return 1
+    fi
+    if [ -e "$pd" ] || [ -L "$pd" ]; then
+        return 1
+    fi
+    "$quc_bin_mkdir" -p -- "$pd" 2>/dev/null || return 1
+    "$quc_bin_chmod" 700 -- "$pd" 2>/dev/null || return 1
+    printf '%s\n' "$pd"
+}
+
+quc_remove_probe_dir() {
+    pd=$1
+    [ -n "$pd" ] || return 1
+    if [ -L "$pd" ] || [ ! -d "$pd" ]; then
+        return 1
+    fi
+    ok=0
+    if [ -n "${quc_runtime_base:-}" ]; then
+        case $pd in
+            "$quc_runtime_base"/probe.*) ok=1 ;;
+        esac
+    fi
+    if [ -n "${quc_state_dir:-}" ]; then
+        case $pd in
+            "$quc_state_dir"/probe.*) ok=1 ;;
+        esac
+    fi
+    [ "$ok" = 1 ] || return 1
+    "$quc_bin_rm" -rf -- "$pd"
+}
+
+quc_cmd_doctor() {
+    if [ "$#" -ne 0 ]; then
+        printf '%s\n' "doctor не принимает аргументы." >&2
+        printf '%s\n' "error_code=E_USAGE" >&2
+        return 2
+    fi
+    printf 'quiet-usb-copy %s\n' "$QUC_VERSION"
+    printf 'build %s\n' "$QUC_BUILD"
+    printf '%s\n' "Обязательные программы: найдены."
+    if "$quc_bin_find" /proc/self -xdev -print0 -quit >/dev/null 2>&1; then
+        printf '%s\n' "find -print0: да"
+    else
+        printf '%s\n' "find -print0: нет"
+    fi
+    printf 'awk: %s\n' "$quc_bin_awk"
+    if [ -n "${quc_bin_sync:-}" ]; then
+        printf 'sync: %s\n' "$quc_bin_sync"
+    else
+        printf '%s\n' "sync: нет в PATH"
+    fi
+    if [ -n "${quc_bin_findmnt:-}" ]; then
+        printf '%s\n' "findmnt: да, необязательная программа"
+    else
+        printf '%s\n' "findmnt: нет, для меток используется /dev/disk/by-label"
+    fi
+    sync_mode=none
+    if quc_prepare_state; then
+        probe=$(quc_make_probe_dir) || probe=
+        if [ -n "$probe" ]; then
+            saved_job=${quc_job_dir:-}
+            saved_run=${quc_run_dir:-}
+            quc_job_dir=$probe
+            quc_run_dir=$probe
+            quc_probe_copy_tools || true
+            sync_mode=${quc_sync_mode:-none}
+            quc_job_dir=$saved_job
+            quc_run_dir=$saved_run
+            quc_remove_probe_dir "$probe" || true
+        fi
+        printf 'sync-проба: %s\n' "$sync_mode"
+        if [ -n "${quc_runtime_base:-}" ]; then
+            printf 'Временный каталог: %s\n' "$quc_runtime_base"
+        else
+            printf '%s\n' "Временный каталог: запасной внутри каталога состояния, XDG_RUNTIME_DIR не использован."
+        fi
+        printf 'Каталог состояния: %s\n' "$quc_state_dir"
+    else
+        printf '%s\n' "Служебный каталог недоступен."
+        printf '%s\n' "error_code=E_ENV"
+        return 70
+    fi
+    printf '%s\n' "Профиль gentle: nice 19 и ionice best-effort 7 только у своего процесса. Задержки флешки этим не отменяются."
+    printf '%s\n' "Меню не обходит дерево файлов, пока не выбраны оба пути."
+    printf '%s\n' "Уведомления других программ не отключаются. Своих окон и звуков нет."
+    printf '%s\n' "Коды выхода: 0 принята, 1 отказ или сбой, 2 аргументы, 70 среда."
+    printf '%s\n' "error_code: E_OK E_FAIL E_USAGE E_ENV E_REJECT E_NOJOB."
+    printf '%s\n' "Этот запуск не подтверждает дистрибутив. Полный набор этой копии выполнялся на Pop!_OS 24.04. РЕД ОС, Fedora и RHEL не отмечены как проверенные."
+    printf '%s\n' "error_code=E_OK"
+    return 0
+}
+
+quc_cmd_selftest() {
+    if [ "$#" -ne 0 ]; then
+        printf '%s\n' "selftest не принимает аргументы." >&2
+        printf '%s\n' "error_code=E_USAGE" >&2
+        return 2
+    fi
+    st_bad=0
+    got=$(quc_decide_copy_status '' 1 0 0 0 0)
+    [ "$got" = SUCCESS ] || st_bad=$(quc_add_bytes "$st_bad" 1)
+    sample='a b'
+    enc=$(quc_hex_encode "$sample")
+    if ! quc_decode_hex_var "$enc" || [ "$quc_decoded" != "$sample" ]; then
+        st_bad=$(quc_add_bytes "$st_bad" 1)
+    fi
+    quc_volume_candidate /dev/sdb1 vfat /media/DISK yes || st_bad=$(quc_add_bytes "$st_bad" 1)
+    quc_volume_candidate /dev/weird-name1 exfat /media/ODD yes || st_bad=$(quc_add_bytes "$st_bad" 1)
+    quc_volume_candidate tmpfs tmpfs /media/DISK yes && st_bad=$(quc_add_bytes "$st_bad" 1)
+    quc_volume_candidate /dev/sda1 ext4 /home yes && st_bad=$(quc_add_bytes "$st_bad" 1)
+    quc_volume_candidate /dev/nvme0n1p1 ext4 /mnt/data no && st_bad=$(quc_add_bytes "$st_bad" 1)
+    quc_volume_candidate /dev/mmcblk0p1 vfat /media/ODD unknown && st_bad=$(quc_add_bytes "$st_bad" 1)
+    quc_answer_is_yes "да" || st_bad=$(quc_add_bytes "$st_bad" 1)
+    quc_answer_is_yes "yes" && st_bad=$(quc_add_bytes "$st_bad" 1)
+    quc_default_job_vars
+    quc_copy_status=SUCCESS
+    quc_verify_status=size
+    quc_sync_status=command_ok
+    quc_files_done=1
+    quc_files_total=1
+    quc_profile=gentle
+    text=$(quc_print_human)
+    case $text in
+        *'Копирование завершено.'*) ;;
+        *) st_bad=$(quc_add_bytes "$st_bad" 1) ;;
+    esac
+    case $text in
+        *'Для извлечения'*) ;;
+        *) st_bad=$(quc_add_bytes "$st_bad" 1) ;;
+    esac
+    case $text in
+        *'можно извлекать'*) st_bad=$(quc_add_bytes "$st_bad" 1) ;;
+    esac
+    case $text in
+        *'copy_status='*) st_bad=$(quc_add_bytes "$st_bad" 1) ;;
+    esac
+    quc_copy_status=PARTIAL
+    quc_error='ошибка чтения'
+    text=$(quc_print_human)
+    case $text in
+        *'Копирование завершено частично.'*) ;;
+        *) st_bad=$(quc_add_bytes "$st_bad" 1) ;;
+    esac
+    case $text in
+        *'Копирование завершено.'*) st_bad=$(quc_add_bytes "$st_bad" 1) ;;
+    esac
+    case $text in
+        *'Причина: ошибка чтения'*) ;;
+        *) st_bad=$(quc_add_bytes "$st_bad" 1) ;;
+    esac
+    case $text in
+        *'Подробнее: report'*) ;;
+        *) st_bad=$(quc_add_bytes "$st_bad" 1) ;;
+    esac
+    caut=$(quc_fs_caution mysteryfs || true)
+    case $caut in
+        *'непроверен'*) ;;
+        *) st_bad=$(quc_add_bytes "$st_bad" 1) ;;
+    esac
+    case $caut in
+        *'запускать нельзя'*) st_bad=$(quc_add_bytes "$st_bad" 1) ;;
+    esac
+    caut=$(quc_fs_caution ext4 || true)
+    if [ -n "$caut" ]; then
+        st_bad=$(quc_add_bytes "$st_bad" 1)
+    fi
+    msg=$(quc_disk_pair_problem tmpfs tmpfs || true)
+    if [ -n "$msg" ]; then
+        st_bad=$(quc_add_bytes "$st_bad" 1)
+    fi
+    if [ "$st_bad" != 0 ]; then
+        printf 'selftest: ошибки %s\n' "$st_bad" >&2
+        printf '%s\n' "error_code=E_FAIL" >&2
+        return 1
+    fi
+    printf '%s\n' "selftest: готово"
+    printf '%s\n' "error_code=E_OK"
+    return 0
+}
+
+quc_cleanup_one_tree() {
+    root=$1
+    [ -n "$root" ] || return 0
+    [ -d "$root" ] || return 0
+    [ -L "$root" ] && return 0
+    cl_list=$quc_state_dir/cleanup.list.$$
+    : > "$cl_list" || return 1
+    "$quc_bin_find" "$root" -mindepth 1 -maxdepth 1 -type d -print > "$cl_list" 2>/dev/null || true
+    while IFS= read -r cl_dir || [ -n "$cl_dir" ]; do
+        [ -n "$cl_dir" ] || continue
+        case $cl_dir in
+            "$root"/*) ;;
+            *) continue ;;
+        esac
+        if [ -L "$cl_dir" ] || [ ! -d "$cl_dir" ]; then
+            continue
+        fi
+        cl_id=$("$quc_bin_basename" -- "$cl_dir")
+        if [ -d "$quc_jobs_dir/$cl_id" ]; then
+            continue
+        fi
+        quc_job_id=$cl_id
+        quc_rm_owned_dir "$cl_dir" || true
+    done < "$cl_list"
+    "$quc_bin_rm" -f -- "$cl_list" 2>/dev/null || true
+}
+
+quc_cmd_cleanup() {
+    quc_cleanup_dry=0
+    if [ "$#" -eq 1 ] && [ "$1" = "--dry-run" ]; then
+        quc_cleanup_dry=1
+    elif [ "$#" -ne 0 ]; then
+        printf '%s\n' "cleanup принимает только --dry-run и удаляет только служебные данные Quiet USB Copy." >&2
+        printf '%s\n' "error_code=E_USAGE" >&2
+        return 2
+    fi
+    if ! quc_prepare_state; then
+        printf '%s\n' "Служебный каталог недоступен." >&2
+        printf '%s\n' "error_code=E_ENV" >&2
+        return 70
+    fi
+    kept=0
+    removed=0
+    cl_list=$quc_state_dir/cleanup.list.$$
+    : > "$cl_list" || return 1
+    "$quc_bin_find" "$quc_jobs_dir" -mindepth 1 -maxdepth 1 \( -type d -o -type l \) -print > "$cl_list" 2>/dev/null || true
+    while IFS= read -r cl_dir || [ -n "$cl_dir" ]; do
+        [ -n "$cl_dir" ] || continue
+        case $cl_dir in
+            "$quc_jobs_dir"/*) ;;
+            *) continue ;;
+        esac
+        cl_id=$("$quc_bin_basename" -- "$cl_dir")
+        if [ -L "$cl_dir" ]; then
+            printf 'Можно удалить: %s\n' "$cl_id"
+            if [ "$quc_cleanup_dry" != 1 ]; then
+                "$quc_bin_rm" -f -- "$cl_dir" 2>/dev/null || true
+            fi
+            removed=$(quc_add_bytes "$removed" 1)
+            continue
+        fi
+        if ! quc_job_id_safe "$cl_id" || ! quc_load_state "$cl_dir/state"; then
+            printf 'Оставлено: %s\n' "$cl_id"
+            kept=$(quc_add_bytes "$kept" 1)
+            continue
+        fi
+        case $quc_copy_status in
+            RUNNING|STARTING)
+                printf 'Оставлено выполняющееся задание: %s\n' "$cl_id"
+                kept=$(quc_add_bytes "$kept" 1)
+                continue
+                ;;
+        esac
+        printf 'Можно удалить: %s\n' "$cl_id"
+        if [ "$quc_cleanup_dry" = 1 ]; then
+            removed=$(quc_add_bytes "$removed" 1)
+            continue
+        fi
+        quc_job_id=$cl_id
+        quc_job_dir=$cl_dir
+        quc_open_run_dir
+        quc_drop_scratch
+        "$quc_bin_rm" -rf -- "$cl_dir" 2>/dev/null || true
+        if [ -d "$cl_dir" ]; then
+            printf 'Не удалось удалить: %s\n' "$cl_id" >&2
+            kept=$(quc_add_bytes "$kept" 1)
+        else
+            removed=$(quc_add_bytes "$removed" 1)
+        fi
+    done < "$cl_list"
+    "$quc_bin_rm" -f -- "$cl_list" 2>/dev/null || true
+    if [ "$quc_cleanup_dry" != 1 ]; then
+        quc_runtime_prepare || true
+        if [ -n "${quc_runtime_base:-}" ]; then
+            quc_cleanup_one_tree "$quc_runtime_base/jobs"
+            menu_root=$quc_runtime_base
+            if [ -d "$menu_root" ] && [ ! -L "$menu_root" ]; then
+                "$quc_bin_find" "$menu_root" -mindepth 1 -maxdepth 1 -type f -name 'menu.*' -print 2>/dev/null | while IFS= read -r menu_file || [ -n "$menu_file" ]; do
+                    case $menu_file in
+                        "$menu_root"/menu.*) "$quc_bin_rm" -f -- "$menu_file" 2>/dev/null || true ;;
+                    esac
+                done
+            fi
+        fi
+        if [ -d "$quc_state_dir/run/jobs" ]; then
+            quc_cleanup_one_tree "$quc_state_dir/run/jobs"
+        fi
+        if [ -d "$quc_state_dir" ] && [ ! -L "$quc_state_dir" ]; then
+            "$quc_bin_find" "$quc_state_dir" -mindepth 1 -maxdepth 1 -type f -name 'menu.*' -print 2>/dev/null | while IFS= read -r menu_file || [ -n "$menu_file" ]; do
+                case $menu_file in
+                    "$quc_state_dir"/menu.*) "$quc_bin_rm" -f -- "$menu_file" 2>/dev/null || true ;;
+                esac
+            done
+        fi
+        if [ -f "$quc_current" ]; then
+            cur=$(quc_current_id || true)
+            if [ -z "$cur" ] || [ ! -d "$quc_jobs_dir/$cur" ]; then
+                "$quc_bin_rm" -f -- "$quc_current" 2>/dev/null || true
+            fi
+        fi
+        if [ "$kept" = 0 ]; then
+            if quc_read_owner && quc_pid_is_worker "$quc_owner_pid" "$quc_owner_start" "$quc_jobs_dir/$quc_owner_job"; then
+                printf '%s\n' "Блокировка выполняющегося задания не тронута."
+            else
+                "$quc_bin_rm" -f -- "$quc_last_error" "$quc_owner" 2>/dev/null || true
+                if [ -d "$quc_state_dir/lock.d" ] && [ ! -L "$quc_state_dir/lock.d" ]; then
+                    "$quc_bin_rm" -rf -- "$quc_state_dir/lock.d" 2>/dev/null || true
+                fi
+            fi
+        fi
+    fi
+    if [ "$quc_cleanup_dry" = 1 ]; then
+        printf '%s\n' "Удаление не выполнялось."
+        printf 'Будет удалено служебных заданий: %s\n' "$removed"
+    else
+        printf 'Удалено служебных заданий: %s\n' "$removed"
+    fi
+    printf 'Оставлено незавершённых: %s\n' "$kept"
+    printf '%s\n' "error_code=E_OK"
+    return 0
+}
+
 quc_main() {
     set -f
     umask 077
     export LC_ALL=C
+    case ${1:-} in
+        version|--version|-V)
+            quc_cmd_version
+            return 0
+            ;;
+        help|-h|--help)
+            quc_cmd_help
+            return 0
+            ;;
+    esac
     if ! quc_resolve_tools; then
         if [ "${1:-}" = start ] || [ "${1:-}" = resume ] || [ "${1:-}" = _worker ]; then
             exit 70
@@ -2986,12 +4203,14 @@ quc_main() {
         exit 70
     fi
     quc_self=$(quc_self_path) || exit 70
-    cmd=${1:-help}
-    if [ "$#" -gt 0 ]; then
-        shift
+    if [ "$#" -eq 0 ]; then
+        quc_cmd_interactive
+        return $?
     fi
+    cmd=$1
+    shift
     case $cmd in
-        start|check|status|report|stop|resume|verify|help|-h|--help|_worker) ;;
+        start|check|status|report|stop|resume|verify|help|-h|--help|doctor|selftest|cleanup|version|_worker) ;;
         *)
             if [ "$#" -eq 1 ]; then
                 set -- "$cmd" "$1"
@@ -3011,6 +4230,10 @@ quc_main() {
         stop) quc_cmd_stop "$@" ;;
         resume) quc_cmd_resume "$@" ;;
         verify) quc_cmd_verify "$@" ;;
+        doctor) quc_cmd_doctor "$@" ;;
+        selftest) quc_cmd_selftest "$@" ;;
+        cleanup) quc_cmd_cleanup "$@" ;;
+        version) quc_cmd_version "$@" ;;
         _worker) quc_cmd_worker "$@" ;;
     esac
 }
