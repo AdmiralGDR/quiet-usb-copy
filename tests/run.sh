@@ -80,7 +80,9 @@ trap cleanup EXIT
 trap 'cleanup; exit 1' INT TERM
 
 pass() {
-    printf 'PASS %s\n' "$current"
+    quc_case_ended=$(date +%s)
+    quc_case_secs=$((quc_case_ended - ${quc_case_started:-$quc_case_ended}))
+    printf 'PASS %s %ss\n' "$current" "$quc_case_secs"
     passes=$((passes + 1))
 }
 
@@ -101,12 +103,21 @@ begin_test() {
     PATH=$ORIG_PATH
     unset QUC_FILE_PAUSE
     unset QUC_POST_COPY_DELAY
+    unset QUC_PRE_PUBLISH_PAUSE
+    unset QUC_PRE_MARK_PAUSE
+    unset QUC_FILL_PAUSE
     unset QUC_FAKE_VOLUMES
+    unset QUC_PTY_TIMEOUT
     unset LD_PRELOAD
+    unset XDG_DATA_HOME
+    unset NO_COLOR
+    unset COLUMNS
+    unset LINES
     export HOME=$WORK/home
     export XDG_STATE_HOME=$WORK/xdg-$current
     export XDG_RUNTIME_DIR=$WORK/run-$current
     export LC_ALL=C
+    quc_case_started=$(date +%s)
     mkdir -p "$HOME" "$XDG_STATE_HOME" "$XDG_RUNTIME_DIR" "$WORK/t-$current"
     quc_run_dir=
     quc_runtime_base=
@@ -178,7 +189,15 @@ job_field() {
 }
 
 wait_done() {
+    # The argument counts 0.25 s polls. Under load a worker can stay in
+    # CREATED for several seconds, so every wait gets at least
+    # QUC_TEST_WAIT_MIN polls (default 240, that is 60 s). Only the ceiling
+    # grows: a terminal copy_status still returns at once.
     max=${1:-120}
+    min=${QUC_TEST_WAIT_MIN:-240}
+    if [ "$max" -lt "$min" ]; then
+        max=$min
+    fi
     i=0
     st=''
     while [ "$i" -lt "$max" ]; do
@@ -197,8 +216,19 @@ wait_done() {
 }
 
 wait_phase() {
+    # The phase field is the event. Return as soon as it contains the needle.
+    # A terminal copy_status returns at once. The second argument is only a
+    # hang ceiling in seconds, polled every 0.2s. Callers pass 80. That used
+    # to mean 80 iterations, about 16s. In suite-rc3-final.log the nice-19
+    # worker of job 20261101T053908-671488-55efbe66 was logged at 05:39:12 and
+    # was still phase=planning when that 16s poll ended near 05:39:28. The
+    # ceiling is therefore 80 seconds. It is not a sleep before the check.
     needle=$1
-    max=${2:-80}
+    secs=${2:-80}
+    case $secs in
+        ''|*[!0-9]*) secs=80 ;;
+    esac
+    max=$((secs * 5))
     i=0
     while [ "$i" -lt "$max" ]; do
         ph=$(job_field phase || true)
@@ -283,7 +313,7 @@ test_static() {
         bad=1
     fi
     run_quiet "$SH" "$SCRIPT" version
-    if [ "$quc_ec" -ne 0 ] || ! grep -q '^quiet-usb-copy 0.3.0$' "$quc_out" || ! grep -q '^build 20261029.2$' "$quc_out"; then
+    if [ "$quc_ec" -ne 0 ] || ! grep -q '^quiet-usb-copy 0.4.0-rc.5$' "$quc_out" || ! grep -q '^build 20261101.3$' "$quc_out"; then
         echo "version output"
         cat "$quc_out" "$quc_err"
         bad=1
@@ -1419,6 +1449,7 @@ test_T15() {
         bad=1
     else
         printf 'SHORT\n' > "$dst/$copied"
+        t15_sha=$(sha256sum -- "$dst/$copied" | awk '{ print $1 }')
     fi
     unset QUC_FILE_PAUSE
     run_resume
@@ -1427,13 +1458,27 @@ test_T15() {
         bad=1
     fi
     st=$(wait_done 120)
-    if [ "$st" != SUCCESS ]; then
-        echo "resume status=$st"
+    # Прежнее ожидание SUCCESS требовало заменить SHORT. Это чужое содержимое.
+    # Новая спецификация: SHORT остаётся, статус не SUCCESS, остальные файлы можно дописать.
+    if [ "$st" = SUCCESS ]; then
+        echo "resume replaced foreign content status=$st"
         bad=1
     fi
-    trees_ok "$src" "$dst" || bad=1
+    if [ -z "$copied" ] || [ "$(sha256sum -- "$dst/$copied" | awk '{ print $1 }')" != "$t15_sha" ] || [ "$(cat "$dst/$copied")" != SHORT ]; then
+        echo "published file was replaced"
+        bad=1
+    fi
+    for name in a.txt b.txt c.txt; do
+        if [ "$name" = "$copied" ]; then
+            continue
+        fi
+        if [ -f "$dst/$name" ] && ! cmp -s "$src/$name" "$dst/$name"; then
+            echo "later file mismatch $name"
+            bad=1
+        fi
+    done
     src_same || bad=1
-    if [ "$bad" -eq 0 ]; then pass; else fail "resume"; fi
+    if [ "$bad" -eq 0 ]; then pass; else fail "resume keeps changed file"; fi
 }
 
 test_T16() {
@@ -1936,12 +1981,12 @@ test_T27() {
 test_dx() {
     bad=0
     run_quiet "$SH" "$SCRIPT" version
-    if [ "$quc_ec" -ne 0 ] || ! grep -q '^quiet-usb-copy 0.3.0$' "$quc_out" || ! grep -q '^build 20261029.2$' "$quc_out"; then
+    if [ "$quc_ec" -ne 0 ] || ! grep -q '^quiet-usb-copy 0.4.0-rc.5$' "$quc_out" || ! grep -q '^build 20261101.3$' "$quc_out"; then
         echo "version"
         bad=1
     fi
     run_quiet "$SH" "$SCRIPT" help
-    if [ "$quc_ec" -ne 0 ] || ! grep -q 'doctor' "$quc_out" || ! grep -q 'selftest' "$quc_out" || ! grep -q 'gentle' "$quc_out"; then
+    if [ "$quc_ec" -ne 0 ] || ! grep -q 'doctor' "$quc_out" || ! grep -q 'selftest' "$quc_out" || ! grep -q 'gentle' "$quc_out" || ! grep -q 'source_dependency' "$quc_out" || ! grep -q 'Если на экране есть 4' "$quc_out"; then
         echo "help"
         bad=1
     fi
@@ -1967,7 +2012,7 @@ test_dx() {
         bad=1
     fi
     run_quiet "$SH" "$SCRIPT" doctor
-    if [ "$quc_ec" -ne 0 ] || ! grep -q '^error_code=E_OK$' "$quc_out" || ! grep -q 'find -print0: да' "$quc_out" || ! grep -q '^sync-проба: data$' "$quc_out" || ! grep -q 'Pop!_OS 24.04' "$quc_out" || ! grep -q 'не отмечены как проверенные' "$quc_out"; then
+    if [ "$quc_ec" -ne 0 ] || ! grep -q '^error_code=E_OK$' "$quc_out" || ! grep -q 'find -print0: да' "$quc_out" || ! grep -q '^sync-проба: data$' "$quc_out" || ! grep -q 'Pop!_OS 24.04' "$quc_out" || ! grep -q 'не отмечены как проверенные' "$quc_out" || ! grep -q '^compat_level=LIMITED$' "$quc_out" || ! grep -q '^fs_gate=UNKNOWN$' "$quc_out" || ! grep -q '^host_write=SUPPORTED$' "$quc_out" || ! grep -q '^fd_publish=SUPPORTED$' "$quc_out" || grep -q '^compat_level=SUPPORTED$' "$quc_out"; then
         echo "doctor"
         cat "$quc_out" "$quc_err"
         bad=1
@@ -2062,12 +2107,16 @@ test_UX01() {
         echo "menu slow first=$quc_pty_first"
         bad=1
     fi
-    if ! grep -q 'Quiet USB Copy' "$quc_out" || ! grep -q 'PRESENTATION' "$quc_out" || ! grep -q 'BACKUP' "$quc_out" || ! grep -q 'Проверка: готово' "$quc_out" || ! grep -q 'Копирование запущено в фоне' "$quc_out"; then
+    if ! grep -q 'Quiet USB Copy' "$quc_out" || ! grep -q 'PRESENTATION' "$quc_out" || ! grep -q 'BACKUP' "$quc_out" || ! grep -q 'Направление:' "$quc_out" || ! grep -q 'Режим: прямой' "$quc_out" || ! grep -q 'Размещение: корень назначения' "$quc_out" || ! grep -q 'Вердикт: можно копировать с ограничением.' "$quc_out" || ! grep -q 'Существующие имена не заменяются.' "$quc_out" || ! grep -q 'Копирование запущено в фоне' "$quc_out"; then
         echo "menu text"
         cat "$quc_out"
         bad=1
     fi
-    if ! awk 'index($0, "Проверка: готово") { seen=1 } index($0, "Копирование запущено") { if (!seen) bad=1 } END { exit bad+0 }' "$quc_out"; then
+    if grep -q 'Проверки:' "$quc_out" || grep -q 'Проверка: готово' "$quc_out" || grep -q '^Вердикт:.*OK' "$quc_out" || grep -q 'Режим: DIRECT' "$quc_out" || grep -q 'Размещение: ROOT' "$quc_out" || grep -q 'source_dependency=' "$quc_out" || grep -q 'copy_status=' "$quc_out"; then
+        echo "details or blanket OK on the main screen"
+        bad=1
+    fi
+    if ! awk 'index($0, "Вердикт:") { seen=1 } index($0, "Копирование запущено") { if (!seen) bad=1 } END { exit bad+0 }' "$quc_out"; then
         echo "launch before preflight"
         bad=1
     fi
@@ -2106,7 +2155,7 @@ test_UX03() {
     make_pair || { fail "mount"; return; }
     printf '%s\n%s\n1\n0\n' "$src" "$src" > "$WORK/t-$current/in"
     pty_run "$WORK/t-$current/in" /bin/sh "$SCRIPT"
-    if [ "$quc_ec" != 0 ] || ! grep -q 'один и тот же' "$quc_out" || ! grep -q 'запускать нельзя' "$quc_out" || ! grep -q 'Запуск запрещён.' "$quc_out" || grep -q 'Копирование запущено' "$quc_out"; then
+    if [ "$quc_ec" != 0 ] || ! grep -q 'один и тот же' "$quc_out" || ! grep -q 'копировать нельзя' "$quc_out" || ! grep -q 'Запуск запрещён.' "$quc_out" || grep -q 'Копирование запущено' "$quc_out"; then
         echo "same device"
         cat "$quc_out"
         bad=1
@@ -2158,7 +2207,7 @@ test_UX06() {
     export QUC_FAKE_VOLUMES=$fake
     printf '1\n2\n0\n' > "$WORK/t-$current/in"
     pty_run "$WORK/t-$current/in" /bin/sh "$SCRIPT"
-    if [ "$quc_ec" != 0 ] || ! grep -q 'ONE' "$quc_out" || ! grep -q 'TWO' "$quc_out" || ! grep -q 'THREE' "$quc_out" || ! grep -q 'ONE → TWO' "$quc_out" || ! grep -q 'Проверка: готово' "$quc_out" || grep -q 'Копирование запущено' "$quc_out"; then
+    if [ "$quc_ec" != 0 ] || ! grep -q 'ONE' "$quc_out" || ! grep -q 'TWO' "$quc_out" || ! grep -q 'THREE' "$quc_out" || ! grep -q 'ONE → TWO' "$quc_out" || ! grep -q 'Вердикт: можно копировать с ограничением.' "$quc_out" || grep -q 'Копирование запущено' "$quc_out"; then
         echo "several"
         cat "$quc_out"
         bad=1
@@ -2176,7 +2225,7 @@ test_UX07() {
     export QUC_FAKE_VOLUMES=$fake
     printf '1\n2\n0\n' > "$WORK/t-$current/in"
     pty_run "$WORK/t-$current/in" /bin/sh "$SCRIPT"
-    if [ "$quc_ec" != 0 ] || ! grep -q 'без метки' "$quc_out" || ! grep -q 'Проверка: готово' "$quc_out" || ! no_esc "$quc_out"; then
+    if [ "$quc_ec" != 0 ] || ! grep -q 'без метки' "$quc_out" || ! grep -q 'Вердикт: можно копировать с ограничением.' "$quc_out" || ! no_esc "$quc_out"; then
         echo "unlabeled"
         cat "$quc_out"
         bad=1
@@ -2203,7 +2252,7 @@ test_UX08() {
     py=$(PATH=$ORIG_PATH command -v python3)
     env PATH="$lim" "$py" "$ROOT/tests/pty_menu.py" --timeout 30 --input "$WORK/t-$current/in" --output "$WORK/last.out" -- /bin/sh "$SCRIPT" >"$WORK/last.pty" 2>"$WORK/last.err"
     quc_ec=$(awk -F= '$1 == "PTY_EXIT" { print $2; exit }' "$WORK/last.pty")
-    if [ "$quc_ec" != 0 ] || ! grep -q 'Проверка: готово' "$WORK/last.out" || grep -q 'Копирование запущено' "$WORK/last.out"; then
+    if [ "$quc_ec" != 0 ] || ! grep -q 'Вердикт: можно копировать с ограничением.' "$WORK/last.out" || grep -q 'Копирование запущено' "$WORK/last.out"; then
         echo "optional tools ec=$quc_ec"
         cat "$WORK/last.out" "$WORK/last.err"
         bad=1
@@ -2405,7 +2454,7 @@ test_UX13() {
     make_pair || { fail "mount"; return; }
     printf '%s\n%s\n0\n' "$src" "$dst" > "$WORK/t-$current/in"
     pty_run "$WORK/t-$current/in" /bin/sh "$SCRIPT"
-    if [ "$quc_ec" != 0 ] || ! grep -q 'Проверка: готово' "$quc_out" || grep -q 'запускать нельзя' "$quc_out"; then
+    if [ "$quc_ec" != 0 ] || ! grep -q 'Вердикт: можно копировать с ограничением.' "$quc_out" || grep -q 'запускать нельзя' "$quc_out" || grep -q 'копировать нельзя' "$quc_out"; then
         echo "known fs preflight"
         cat "$quc_out"
         bad=1
@@ -2504,6 +2553,28 @@ test_UX15() {
     if [ "$bad" -eq 0 ]; then pass; else fail "resume after stop"; fi
 }
 
+test_UX16() {
+    bad=0
+    make_pair || { fail "mount"; return; }
+    printf 'slide\n' > "$src/deck.txt"
+    fake=$WORK/t-$current/fake.tsv
+    fake_row "$src" ext4 tmpfs ONE 1000 1000 > "$fake"
+    fake_row "$dst" ext4 tmpfs TWO 2000 2000 >> "$fake"
+    export QUC_FAKE_VOLUMES=$fake
+    printf '1\n2\n2\n0\n' > "$WORK/t-$current/in"
+    pty_run "$WORK/t-$current/in" /bin/sh "$SCRIPT"
+    if [ "$quc_ec" != 0 ] || ! grep -q 'Подробности' "$quc_out" || ! grep -q 'Запуск не начат.' "$quc_out" || ! grep -q 'Проверки:' "$quc_out" || ! grep -q 'Жёсткие ссылки на назначении: не проверялись' "$quc_out" || grep -q 'Копирование запущено' "$quc_out"; then
+        echo "details"
+        cat "$quc_out"
+        bad=1
+    fi
+    if [ -f "$XDG_STATE_HOME/quiet-usb-copy/current" ]; then
+        echo "details started a job"
+        bad=1
+    fi
+    if [ "$bad" -eq 0 ]; then pass; else fail "details without start"; fi
+}
+
 if [ "$(id -u)" != 0 ]; then
     echo "FAIL setup: user namespace did not map root"
     exit 1
@@ -2560,6 +2631,11 @@ run_case UX12 test_UX12
 run_case UX13 test_UX13
 run_case UX14 test_UX14
 run_case UX15 test_UX15
+run_case UX16 test_UX16
+
+# 0.4.0 groups A–D. The 0.3.0 cases above stay registered.
+# shellcheck disable=SC1091
+. "$ROOT/tests/cases_040.sh"
 
 leaked=$(count_live "$WORK")
 if [ "$leaked" != 0 ]; then
