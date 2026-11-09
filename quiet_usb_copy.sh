@@ -16,11 +16,28 @@
 # живой файловой системы. Контрольная сумма — отдельный verify_status.
 # Сброс на носитель — отдельный sync_status. Даже command_ok не разрешает
 # физически извлекать накопитель: нужна штатная процедура безопасного извлечения ОС.
+# eject_status отдельно от copy_status. Успех копирования не означает,
+# что назначение отключено. Автоотключение касается только назначения.
+
+# Разделы этого файла, по месту, без перестановки функций:
+#   Общие настройки и константы
+#   Вспомогательные функции
+#   Служебные каталоги
+#   Состояние и восстановление
+#   Устройства и файловые системы
+#   Предварительная проверка
+#   Безопасное копирование
+#   Локальная копия STAGED
+#   Автоматическое отключение
+#   Пользовательский интерфейс
+#   Диагностика и точка входа
 
 umask 077
 
-QUC_VERSION=0.4.0-rc.5
-QUC_BUILD=20261101.3
+# --- Общие настройки и константы ---
+
+QUC_VERSION=0.4.0-rc.7
+QUC_BUILD=20261108.2
 QUC_PARTIAL_PREFIX=.quc-partial.
 QUC_MAX_ATTEMPTS=3
 QUC_FAT_MAX=4294967295
@@ -29,6 +46,8 @@ if [ "${QUC_SOURCE_ONLY:-}" != 1 ]; then
     IFS=' 	
 '
 fi
+
+# --- Вспомогательные функции ---
 
 quc_norm_uint() {
     n=$1
@@ -308,6 +327,8 @@ quc_self_path() {
     esac
 }
 
+# --- Служебные каталоги ---
+
 quc_resolve_tools() {
     quc_missing=''
     quc_bin_find=$(command -v find 2>/dev/null || true)
@@ -537,6 +558,8 @@ quc_clear_error() {
     fi
 }
 
+# --- Состояние и восстановление ---
+
 quc_default_job_vars() {
     quc_version=$QUC_VERSION
     quc_job_id=''
@@ -600,6 +623,8 @@ quc_default_job_vars() {
     quc_publish_limited=0
     quc_mount_mark=0
     quc_mount_secret=''
+    quc_eject_policy=no
+    quc_eject_status=skipped_policy
 }
 
 # Повторное кодирование одних и тех же путей на каждом файле плодит процессы od.
@@ -674,6 +699,10 @@ quc_encode_cached() {
     esac
 }
 
+# Пишет состояние на внутренний диск заменой одного файла.
+# Каталог задания уже выбран. Обновляет source_dependency перед записью.
+# Успех: 0. Отказ: 1, предыдущий файл состояния не затирается пустым.
+# eject_status лежит рядом с copy_status и не подменяет его.
 quc_save_state() {
     st_file=$quc_job_dir/state
     st_tmp=$quc_job_dir/state.tmp.$$
@@ -763,6 +792,8 @@ quc_save_state() {
         printf 'stage_tool=%s\n' "${quc_stage_tool:-}"
         printf 'recovery_status=%s\n' "${quc_recovery_status:-none}"
         printf 'job_phase=%s\n' "${quc_job_phase:-CREATED}"
+        printf 'eject_policy=%s\n' "${quc_eject_policy:-no}"
+        printf 'eject_status=%s\n' "${quc_eject_status:-skipped_policy}"
     } > "$st_tmp" || return 1
     "$quc_bin_mv" -f -- "$st_tmp" "$st_file"
 }
@@ -879,6 +910,8 @@ quc_load_state() {
             stage_tool) quc_stage_tool=$val ;;
             recovery_status) quc_recovery_status=$val ;;
             job_phase) quc_job_phase=$val ;;
+            eject_policy) quc_eject_policy=$val ;;
+            eject_status) quc_eject_status=$val ;;
         esac
     done < "$file"
     case $quc_sync_status in
@@ -912,6 +945,14 @@ quc_load_state() {
     case $quc_job_phase in
         CREATED|PREFLIGHT|STAGING|STAGE_VERIFY|READY|TRANSFER|TARGET_VERIFY|COMPLETED|FAILED|PARTIAL|CANCELLED|INTERRUPTED|UNCERTAIN) ;;
         *) quc_job_phase=CREATED ;;
+    esac
+    case ${quc_eject_policy:-} in
+        yes|no) ;;
+        *) quc_eject_policy=no ;;
+    esac
+    case ${quc_eject_status:-} in
+        planned|unmounted|power_off|skipped_policy|unavailable|refused|unknown) ;;
+        *) quc_eject_status=unknown ;;
     esac
     case $quc_dest_rel in
         ''|*[!A-Za-z0-9._-]*) quc_dest_rel='' ;;
@@ -963,6 +1004,8 @@ quc_unescape_field() {
 # Один awk на запрос. Путь передаётся префиксом команды: awk -v раскрывает
 # обратные косые черты. Последнее совпадение побеждает. Номер — первое поле,
 # не major:minor. Байт 0x1c только отделяет хвост от подстановки команды.
+# --- Устройства и файловые системы ---
+
 quc_mountinfo_lookup() {
     mi_path=$1
     quc_mi_fstype=''
@@ -1383,16 +1426,37 @@ quc_dir_nonempty() {
     return 1
 }
 
+# --- Предварительная проверка ---
+
+# Сумма размеров обычных файлов одного каталога.
+# Принимает путь. Печатает целое число байт и больше ничего.
+# Не меняет переменные задания и не копит список путей в переменной.
+# Успех: 0. Отказ: 1, в том числе если обход завершился с ошибкой.
+# Частичная сумма при ошибке обхода не считается результатом.
 quc_tree_bytes() {
-    tb_err=${TMPDIR:-/tmp}/quc-tb.$$
+    tb_rc_file=${TMPDIR:-/tmp}/quc-tbrc.$$
+    tb_err=${TMPDIR:-/tmp}/quc-tberr.$$
+    "$quc_bin_rm" -f -- "$tb_rc_file" "$tb_err" 2>/dev/null || true
     : > "$tb_err" || return 1
-    tb_sizes=$("$quc_bin_find" "$1" -xdev -type f -exec "$quc_bin_stat" -c '%s' {} + 2>"$tb_err")
-    tb_rc=$?
-    "$quc_bin_rm" -f -- "$tb_err" 2>/dev/null || true
-    if [ "$tb_rc" -ne 0 ]; then
-        return 1
+    tb_sum=$(
+        {
+            "$quc_bin_find" "$1" -xdev -type f -exec "$quc_bin_stat" -c '%s' {} +
+            echo $? > "$tb_rc_file"
+        } 2>"$tb_err" | "$quc_bin_awk" '{ s += $1 } END { printf "%.0f", s + 0 }'
+    )
+    tb_rc=1
+    if [ -f "$tb_rc_file" ]; then
+        tb_rc=$("$quc_bin_cat" "$tb_rc_file" 2>/dev/null || printf '1\n')
     fi
-    printf '%s\n' "$tb_sizes" | "$quc_bin_awk" '{ s += $1 } END { printf "%.0f", s + 0 }'
+    "$quc_bin_rm" -f -- "$tb_rc_file" "$tb_err" 2>/dev/null || true
+    case $tb_rc in
+        0) ;;
+        *) return 1 ;;
+    esac
+    case $tb_sum in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    printf '%s\n' "$tb_sum"
 }
 
 quc_fat_limit() {
@@ -1934,6 +1998,12 @@ quc_write_exclusive() {
 # Новое имя: ln без -L, затем mv -n. Принудительного mv нет.
 # Нулевой код mv -n не доказывает перенос: BusyBox оставляет оба файла.
 # После ln или mv назначение должно иметь тот же inode, что и временный файл.
+# --- Безопасное копирование ---
+
+# Публикует уже записанный временный файл под новым именем.
+# Принимает временный путь и конечный путь. Меняет каталог назначения.
+# Успех: 0, только если исходное имя исчезло и inode назначения совпал.
+# Отказ: 11. Существующее чужое имя не заменяется.
 quc_install_new() {
     in_tmp=$1
     in_dst=$2
@@ -2179,6 +2249,10 @@ quc_identity_source_now() {
     return 0
 }
 
+# Сверяет источник и назначение с запомненными идентификаторами.
+# Аргументов нет. При отказе пишет quc_error.
+# Успех: 0. Отказ: 1, копирование этого шага прекращается.
+# Совпадение размера или времени файла здесь не проверяется.
 quc_identity_still() {
     if quc_source_detached; then
         quc_stage_identity || return 1
@@ -2873,6 +2947,11 @@ quc_dest_dir_still() {
     return 0
 }
 
+# Копирует один обычный файл в новое имя.
+# Принимает источник, назначение, относительный путь, hex и отпечаток.
+# Меняет счётчики, quc_error и журнал. Повторяет попытку до QUC_MAX_ATTEMPTS.
+# Успех: 0. Отказ: 2 чтение, 4 размер, 10 носитель, 11 публикация, 20 сигнал.
+# Не заменяет существующее имя и не публикует в другой каталог.
 quc_copy_regular() {
     cr_src=$1
     cr_dst=$2
@@ -3261,6 +3340,10 @@ quc_record_result() {
     return 0
 }
 
+# Обрабатывает один путь плана: каталог, файл или отказ от уже сделанного.
+# Принимает абсолютный путь источника. Меняет счётчики и kind после пропуска.
+# Успех: 0, включая пропуск уже скопированного. Сигнал: 20.
+# Отказ пропуска не записывается как успех: тип источника восстанавливается.
 quc_handle_path() {
     path=$1
     hp_root=${quc_read_root:-$quc_source}
@@ -3572,6 +3655,408 @@ quc_dest_unexpected() {
     return 0
 }
 
+# --- Автоматическое отключение ---
+
+# Есть ли ещё дочерние процессы этого shell.
+# Аргументов нет. Не меняет состояние задания.
+# Успех: 0, детей нет. Отказ: 1, детей нет возможности подтвердить или они есть.
+# Пока дочерний процесс копирования жив, отключение не начинается.
+quc_eject_children_clear() {
+    ej_cf=/proc/$$/task/$$/children
+    if [ ! -r "$ej_cf" ]; then
+        return 1
+    fi
+    ej_kids=''
+    IFS= read -r ej_kids < "$ej_cf" || true
+    if [ -n "$ej_kids" ]; then
+        return 1
+    fi
+    return 0
+}
+
+# Ищет udisksctl и неинтерактивный режим. Не вызывает само отключение.
+# Успех: 0, quc_bin_udisksctl задан. Отказ: 1, вызов делать нельзя.
+# quc_ej_power_tool=1 только если у power-off есть тот же режим.
+quc_eject_tool_ready() {
+    quc_bin_udisksctl=$(command -v udisksctl 2>/dev/null || true)
+    quc_ej_power_tool=0
+    if [ -z "$quc_bin_udisksctl" ] || [ ! -x "$quc_bin_udisksctl" ]; then
+        quc_bin_udisksctl=''
+        return 1
+    fi
+    ej_help=$("$quc_bin_udisksctl" unmount --help 2>&1 || true)
+    case $ej_help in
+        *--no-user-interaction*) ;;
+        *)
+            quc_bin_udisksctl=''
+            return 1
+            ;;
+    esac
+    ej_help=$("$quc_bin_udisksctl" power-off --help 2>&1 || true)
+    case $ej_help in
+        *--no-user-interaction*) quc_ej_power_tool=1 ;;
+    esac
+    return 0
+}
+
+# 0: этот источник относится к тому же диску, что и quc_ej_block / ej_disk.
+# Неразрешённый диск не считается совпадением.
+quc_eject_same_disk() {
+    ej_src=$1
+    ej_disk=$2
+    case $ej_src in
+        /dev/*) ;;
+        *) return 1 ;;
+    esac
+    if [ -n "${quc_ej_block:-}" ] && [ "$ej_src" = "$quc_ej_block" ]; then
+        return 0
+    fi
+    ej_sd=$(quc_disk_name "$ej_src" 0) || return 1
+    if [ -n "$ej_disk" ] && [ -n "$ej_sd" ] && [ "$ej_sd" = "$ej_disk" ]; then
+        return 0
+    fi
+    return 1
+}
+
+# 0: блок или его диск держит корень системы или другой обязательный путь.
+quc_eject_is_system() {
+    ej_block=$1
+    ej_disk=$2
+    for ej_path in / /home /boot /usr /var /tmp; do
+        if [ ! -d "$ej_path" ]; then
+            continue
+        fi
+        if ! quc_mountinfo_lookup "$ej_path"; then
+            continue
+        fi
+        if [ "$quc_mi_source" = "$ej_block" ]; then
+            return 0
+        fi
+        if quc_eject_same_disk "$quc_mi_source" "$ej_disk"; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# 0: у того же диска есть другая используемая точка.
+quc_eject_foreign_live() {
+    ej_disk=$1
+    ej_target=$2
+    ej_file=${TMPDIR:-/tmp}/quc-ejrows.$$
+    "$quc_bin_awk" '
+        function unesc(s,    out, i, n, c, o, v) {
+            out = ""
+            i = 1
+            n = length(s)
+            while (i <= n) {
+                c = substr(s, i, 1)
+                if (c == "\\" && i + 3 <= n && substr(s, i + 1, 3) ~ /^[0-7][0-7][0-7]$/) {
+                    o = substr(s, i + 1, 3)
+                    v = (substr(o, 1, 1) + 0) * 64 + (substr(o, 2, 1) + 0) * 8 + (substr(o, 3, 1) + 0)
+                    out = out sprintf("%c", v)
+                    i += 4
+                } else {
+                    out = out c
+                    i++
+                }
+            }
+            return out
+        }
+        {
+            src = ""
+            for (i = 1; i <= NF; i++) if ($i == "-") { src = $(i + 2); break }
+            if (src == "") next
+            printf "%s\t%s\n", unesc($5), unesc(src)
+        }
+    ' /proc/self/mountinfo > "$ej_file" || {
+        "$quc_bin_rm" -f -- "$ej_file" 2>/dev/null || true
+        return 0
+    }
+    ej_tab=$(printf '\t')
+    ej_found=1
+    while IFS=$ej_tab read -r ej_mp ej_src; do
+        [ -n "$ej_mp" ] || continue
+        if [ "$ej_mp" = "$ej_target" ]; then
+            continue
+        fi
+        if quc_eject_same_disk "$ej_src" "$ej_disk"; then
+            ej_found=0
+            break
+        fi
+    done < "$ej_file"
+    "$quc_bin_rm" -f -- "$ej_file" 2>/dev/null || true
+    return "$ej_found"
+}
+
+# 0: соседние LUN и держатели не мешают снятию питания. Иначе питание не трогаем.
+# Список устройств пишется в файл и читается построчно, без накопления в переменной.
+quc_eject_power_clear() {
+    ej_disk=$1
+    if [ -z "$ej_disk" ]; then
+        return 1
+    fi
+    ej_file=${TMPDIR:-/tmp}/quc-ejlun.$$
+    ej_hold=/sys/class/block/$ej_disk/holders
+    if [ -d "$ej_hold" ]; then
+        "$quc_bin_find" "$ej_hold" -mindepth 1 -maxdepth 1 -print > "$ej_file" 2>/dev/null
+        ej_rc=$?
+        if [ "$ej_rc" -ne 0 ]; then
+            "$quc_bin_rm" -f -- "$ej_file" 2>/dev/null || true
+            return 1
+        fi
+        if [ -s "$ej_file" ]; then
+            "$quc_bin_rm" -f -- "$ej_file" 2>/dev/null || true
+            return 1
+        fi
+    fi
+    ej_link=/sys/class/block/$ej_disk/device
+    if [ ! -L "$ej_link" ]; then
+        "$quc_bin_rm" -f -- "$ej_file" 2>/dev/null || true
+        return 1
+    fi
+    ej_real=$("$quc_bin_readlink" -f -- "$ej_link" 2>/dev/null || true)
+    if [ -z "$ej_real" ]; then
+        "$quc_bin_rm" -f -- "$ej_file" 2>/dev/null || true
+        return 1
+    fi
+    ej_parent=$("$quc_bin_dirname" -- "$ej_real")
+    ej_scope=$("$quc_bin_dirname" -- "$ej_parent")
+    ej_base=$("$quc_bin_basename" -- "$ej_real")
+    "$quc_bin_find" /sys/class/block -mindepth 2 -maxdepth 2 -name device -type l -print > "$ej_file" 2>/dev/null
+    ej_rc=$?
+    if [ "$ej_rc" -ne 0 ] || [ ! -s "$ej_file" ]; then
+        "$quc_bin_rm" -f -- "$ej_file" 2>/dev/null || true
+        return 1
+    fi
+    # 0 — соседнего LUN нет, питание можно рассматривать. 1 — есть другой LUN.
+    ej_blocked=0
+    while IFS= read -r ej_dev; do
+        [ -n "$ej_dev" ] || continue
+        ej_got=$("$quc_bin_readlink" -f -- "$ej_dev" 2>/dev/null || true)
+        case $ej_got in
+            "$ej_scope"/*)
+                ej_bn=$("$quc_bin_basename" -- "$ej_got")
+                if [ "$ej_bn" != "$ej_base" ]; then
+                    ej_blocked=1
+                    break
+                fi
+                ;;
+        esac
+    done < "$ej_file"
+    "$quc_bin_rm" -f -- "$ej_file" 2>/dev/null || true
+    if [ "$ej_blocked" = 1 ]; then
+        return 1
+    fi
+    return 0
+}
+
+# Собирает факты о назначении. Не вызывает udisksctl.
+# Успех: 0 и quc_ej_mount_ok=1. Отказ: 1, отключение делать нельзя.
+# Не меняет copy_status. Питание разрешено только при quc_ej_power_ok=1.
+quc_eject_gather() {
+    quc_ej_block=''
+    quc_ej_disk=''
+    quc_ej_mount_ok=0
+    quc_ej_power_ok=0
+    if ! quc_mountinfo_lookup "$quc_target"; then
+        return 1
+    fi
+    ej_src=$quc_mi_source
+    ej_id=$quc_mi_id
+    if [ -n "${quc_target_mntid:-}" ] && [ "$ej_id" != "$quc_target_mntid" ]; then
+        return 1
+    fi
+    ej_dev=$(quc_dev_of "$quc_target" || true)
+    if [ -z "$ej_dev" ] || [ "$ej_dev" != "${quc_target_dev:-}" ]; then
+        return 1
+    fi
+    if [ -n "${quc_target_uuid:-}" ]; then
+        ej_u=$(quc_uuid_of "$quc_target" || true)
+        if [ "$ej_u" != "$quc_target_uuid" ]; then
+            return 1
+        fi
+    fi
+    case $ej_src in
+        /dev/*) ;;
+        *) return 1 ;;
+    esac
+    if [ -n "${quc_target_spec:-}" ] && [ "$quc_target_spec" != "$ej_src" ]; then
+        return 1
+    fi
+    if [ -n "${quc_source_spec:-}" ] && [ "$ej_src" = "$quc_source_spec" ]; then
+        return 1
+    fi
+    quc_ej_block=$ej_src
+    quc_ej_disk=$(quc_disk_name "$quc_ej_block" 0) || quc_ej_disk=''
+    if [ -z "$quc_ej_disk" ]; then
+        quc_ej_block=''
+        return 1
+    fi
+    if quc_eject_is_system "$quc_ej_block" "$quc_ej_disk"; then
+        quc_ej_block=''
+        return 1
+    fi
+    if quc_mountinfo_lookup "$quc_source"; then
+        if quc_eject_same_disk "$quc_mi_source" "$quc_ej_disk"; then
+            quc_ej_block=''
+            return 1
+        fi
+    fi
+    if ! quc_mountinfo_lookup "$quc_target"; then
+        quc_ej_block=''
+        return 1
+    fi
+    if [ "$quc_mi_source" != "$quc_ej_block" ]; then
+        quc_ej_block=''
+        return 1
+    fi
+    if quc_eject_foreign_live "$quc_ej_disk" "$quc_target"; then
+        quc_ej_block=''
+        return 1
+    fi
+    if [ "${quc_ej_power_tool:-0}" = 1 ] && quc_eject_power_clear "$quc_ej_disk"; then
+        quc_ej_power_ok=1
+    fi
+    quc_ej_mount_ok=1
+    return 0
+}
+
+# Вызывает штатное отключение. Требует quc_ej_mount_ok=1 и уже проверенный блок.
+# Меняет только quc_eject_status. Успех функции: 0.
+# Не использует принудительный режим и не трогает источник.
+quc_eject_run() {
+    if [ "${quc_ej_mount_ok:-0}" != 1 ] || [ -z "${quc_ej_block:-}" ]; then
+        quc_eject_status=skipped_policy
+        return 0
+    fi
+    case $quc_ej_block in
+        /dev/*) ;;
+        *)
+            quc_eject_status=skipped_policy
+            return 0
+            ;;
+    esac
+    if [ -n "${quc_source_spec:-}" ] && [ "$quc_ej_block" = "$quc_source_spec" ]; then
+        quc_eject_status=skipped_policy
+        return 0
+    fi
+    if quc_eject_is_system "$quc_ej_block" "${quc_ej_disk:-}"; then
+        quc_eject_status=skipped_policy
+        return 0
+    fi
+    if [ -z "${quc_bin_udisksctl:-}" ]; then
+        quc_eject_status=unavailable
+        return 0
+    fi
+    ej_cap=${TMPDIR:-/tmp}/quc-ejcap.$$
+    : > "$ej_cap" || ej_cap=''
+    if [ -n "$ej_cap" ]; then
+        "$quc_bin_udisksctl" unmount -b "$quc_ej_block" --no-user-interaction >"$ej_cap" 2>&1
+    else
+        "$quc_bin_udisksctl" unmount -b "$quc_ej_block" --no-user-interaction >/dev/null 2>&1
+    fi
+    ej_rc=$?
+    if quc_mountinfo_lookup "$quc_target"; then
+        ej_still=1
+    else
+        ej_still=0
+    fi
+    if [ "$ej_rc" -ne 0 ] && [ "$ej_still" = 1 ]; then
+        quc_eject_status=refused
+    elif [ "$ej_rc" -ne 0 ] || [ "$ej_still" = 1 ]; then
+        quc_eject_status=unknown
+    else
+        quc_eject_status=unmounted
+        if [ "${quc_ej_power_ok:-0}" = 1 ] && [ -n "${quc_ej_disk:-}" ] && [ -e "/dev/$quc_ej_disk" ] \
+            && ! quc_eject_is_system "$quc_ej_block" "$quc_ej_disk" \
+            && ! quc_eject_foreign_live "$quc_ej_disk" "$quc_target" \
+            && quc_eject_power_clear "$quc_ej_disk"; then
+            if [ -n "$ej_cap" ]; then
+                "$quc_bin_udisksctl" power-off -b "/dev/$quc_ej_disk" --no-user-interaction >"$ej_cap" 2>&1
+            else
+                "$quc_bin_udisksctl" power-off -b "/dev/$quc_ej_disk" --no-user-interaction >/dev/null 2>&1
+            fi
+            ej_rc=$?
+            if [ "$ej_rc" -eq 0 ]; then
+                if [ ! -e "/dev/$quc_ej_disk" ]; then
+                    quc_eject_status=power_off
+                else
+                    "$quc_bin_udisksctl" info -b "/dev/$quc_ej_disk" >"${ej_cap:-/dev/null}" 2>&1
+                    ej_rc=$?
+                    if [ "$ej_rc" -ne 0 ]; then
+                        quc_eject_status=power_off
+                    fi
+                fi
+            fi
+        fi
+    fi
+    if [ -n "$ej_cap" ]; then
+        "$quc_bin_rm" -f -- "$ej_cap" 2>/dev/null || true
+    fi
+    quc_log INFO "eject_status=$quc_eject_status"
+    return 0
+}
+
+# Решает автоотключение назначения после COPY, VERIFY и SYNC.
+# Аргументов нет. Меняет quc_eject_status и файл состояния вызовом снаружи.
+# Успех: 0 всегда. Отказ отключения не меняет copy_status и quc_error.
+# Не отключает источник, не запрашивает пароль и не обходит отказ системы.
+quc_auto_disconnect() {
+    ej_err_saved=${quc_error:-}
+    case ${quc_eject_status:-} in
+        power_off|unmounted)
+            quc_error=$ej_err_saved
+            return 0
+            ;;
+    esac
+    if [ "${quc_eject_policy:-no}" != yes ]; then
+        quc_eject_status=skipped_policy
+        quc_error=$ej_err_saved
+        return 0
+    fi
+    if [ "${quc_copy_status:-}" != SUCCESS ]; then
+        quc_eject_status=skipped_policy
+        quc_error=$ej_err_saved
+        return 0
+    fi
+    case ${quc_verify_status:-none} in
+        checksum|byte|size) ;;
+        *)
+            quc_eject_status=skipped_policy
+            quc_error=$ej_err_saved
+            return 0
+            ;;
+    esac
+    if [ "${quc_sync_status:-unconfirmed}" != command_ok ]; then
+        quc_eject_status=skipped_policy
+        quc_error=$ej_err_saved
+        return 0
+    fi
+    if ! quc_eject_children_clear; then
+        quc_eject_status=skipped_policy
+        quc_error=$ej_err_saved
+        return 0
+    fi
+    if ! quc_eject_tool_ready; then
+        quc_eject_status=unavailable
+        quc_error=$ej_err_saved
+        return 0
+    fi
+    if ! quc_eject_gather; then
+        quc_eject_status=skipped_policy
+        quc_error=$ej_err_saved
+        return 0
+    fi
+    quc_eject_run
+    quc_error=$ej_err_saved
+    return 0
+}
+
+# Ставит итог копирования, затем отдельно автоотключение, затем файл состояния.
+# Принимает вид отказа и текст. Повторный вызов ничего не делает.
+# Успех: 0. copy_status и eject_status остаются разными полями.
+# Не уничтожает локальную копию и не считает отказ отключения провалом копирования.
 quc_finalize() {
     kind=$1
     msg=$2
@@ -3614,8 +4099,10 @@ quc_finalize() {
     quc_ended=$(quc_now)
     quc_ended_epoch=$(quc_epoch)
     quc_phase='done'
+    # Метка уже снята. Повторная проверка метки здесь всегда отказала бы.
+    quc_auto_disconnect
     quc_save_state || true
-    quc_log INFO "result copy_status=$quc_copy_status verify_status=$quc_verify_status sync_status=${quc_sync_status:-unconfirmed} done=$quc_files_done failed=$quc_files_failed uncertain=$quc_files_uncertain skipped=$quc_files_skipped"
+    quc_log INFO "result copy_status=$quc_copy_status verify_status=$quc_verify_status sync_status=${quc_sync_status:-unconfirmed} eject_status=${quc_eject_status:-skipped_policy} done=$quc_files_done failed=$quc_files_failed uncertain=$quc_files_uncertain skipped=$quc_files_skipped"
     if [ -n "$quc_error" ]; then
         quc_log INFO "error=$(quc_one_line "$quc_error")"
     fi
@@ -3816,6 +4303,8 @@ quc_bind_roots() {
     fi
     return 0
 }
+
+# --- Локальная копия STAGED ---
 
 quc_stage_root() {
     sr_base=${XDG_DATA_HOME:-$HOME/.local/share}
@@ -4800,11 +5289,14 @@ Quiet USB Copy копирует один уже смонтированный н�
 
   sh quiet_usb_copy.sh
 
-Один экран: источник, назначение и один вердикт. Затем 1, 2, 3 или 0.
+Один экран: источник, назначение и один вердикт. Затем 1, 2, 3, 5 или 0.
 2 показывает подробности и не запускает копирование. 3 меняет выбор.
 Если на экране есть 4, она начинает предложенную локальную копию.
 1 по-прежнему копирует напрямую. Направление само не угадывается.
-После 1 терминал свободен. Вопрос во время копирования не задаётся.
+На экране видно, включено ли автоматическое отключение назначения.
+1 подтверждает написанную на экране политику. 5 меняет её и не запускает копирование.
+Исходный накопитель программа не отключает. После 1 терминал свободен.
+Вопрос во время копирования не задаётся.
 Если списка нет, введите два абсолютных пути. Вне терминала меню
 не открывается.
 
@@ -4829,6 +5321,7 @@ status и report показывают, нужен ли исходный нако
   sh quiet_usb_copy.sh start --profile gentle --verify ИСТОЧНИК НАЗНАЧЕНИЕ
   sh quiet_usb_copy.sh start --dest-mode separate ИСТОЧНИК НАЗНАЧЕНИЕ
   sh quiet_usb_copy.sh start --source-mode staged ИСТОЧНИК НАЗНАЧЕНИЕ
+  sh quiet_usb_copy.sh start --eject-dest ИСТОЧНИК НАЗНАЧЕНИЕ
   sh quiet_usb_copy.sh plan ИСТОЧНИК НАЗНАЧЕНИЕ
   sh quiet_usb_copy.sh check ИСТОЧНИК НАЗНАЧЕНИЕ
   sh quiet_usb_copy.sh status --machine
@@ -4868,7 +5361,12 @@ UNKNOWN в эти поля не подставляется как READY. Сущ�
 resume не заменяется. Успешные копирование, контрольная сумма и sync не
 заменяют штатное безопасное извлечение средствами операционной системы.
 status и report отдельно показывают копирование, проверку содержимого
-и синхронизацию. doctor без выбранного назначения печатает compat_level
+и синхронизацию. Обычный start не запрашивает отключение назначения.
+Отключение выполняется только после успеха копирования, проверки и
+синхронизации и только если система разрешает его без пароля.
+Отказ системы не отменяет успех копирования. eject_status не заменяет
+copy_status. Значения: planned, unmounted, power_off, skipped_policy,
+unavailable, refused, unknown. doctor без выбранного назначения печатает compat_level
 SUPPORTED, LIMITED или UNSUPPORTED. Неизвестная черта остаётся UNKNOWN
 и не превращается в SUPPORTED. Проба записи идёт в частный каталог, не
 на накопитель. Успех команды не делает файловую систему проверенной.
@@ -4895,7 +5393,8 @@ cleanup удаляет только свои служебные данные и 
 и его локальная копия.
 
 Поля state: copy_status, verify_status, sync_status, stage_status,
-source_mode, dest_mode, recovery_status, job_phase, source_dependency.
+source_mode, dest_mode, recovery_status, job_phase, source_dependency,
+eject_policy, eject_status.
 stage_status: none, preparing, verifying, READY, failed, damaged.
 source_mode: direct, staged. dest_mode: root, separate.
 EOF
@@ -5133,6 +5632,13 @@ quc_begin_job() {
         gentle) ;;
         *) quc_profile=gentle ;;
     esac
+    case ${quc_eject_policy:-no} in
+        yes) quc_eject_status=planned ;;
+        *)
+            quc_eject_policy=no
+            quc_eject_status=skipped_policy
+            ;;
+    esac
     quc_save_state || return 1
     if [ "$publish" = yes ]; then
         printf '%s\n' "$quc_job_id" > "$quc_current" || return 1
@@ -5151,9 +5657,11 @@ quc_cmd_start() {
     quc_dest_mode=root
     quc_dest_rel=
     quc_planned_id=
+    quc_eject_policy=no
     while [ "$#" -gt 0 ]; do
         case $1 in
             --verify) verify=1; shift ;;
+            --eject-dest) quc_eject_policy=yes; shift ;;
             --profile)
                 shift
                 case ${1:-} in
@@ -5235,6 +5743,7 @@ quc_cmd_start() {
         quc_copy_status=FAILED
         quc_fatal_kind=FAILED
         quc_job_phase=FAILED
+        quc_eject_status=skipped_policy
         quc_ended=$(quc_now)
         quc_ended_epoch=$(quc_epoch)
         quc_phase='done'
@@ -5317,6 +5826,8 @@ quc_print_job() {
     printf 'dest_mode=%s\n' "${quc_dest_mode:-root}"
     printf 'recovery_status=%s\n' "${quc_recovery_status:-none}"
     printf 'job_phase=%s\n' "${quc_job_phase:-CREATED}"
+    printf 'eject_policy=%s\n' "${quc_eject_policy:-no}"
+    printf 'eject_status=%s\n' "${quc_eject_status:-skipped_policy}"
     if [ -n "${quc_dest_rel:-}" ]; then
         printf 'dest_rel=%s\n' "$quc_dest_rel"
     fi
@@ -5389,6 +5900,33 @@ quc_print_source_dependency() {
     esac
 }
 
+# Печатает сохранённый итог отключения. Не меняет copy_status и не пересчитывает поле.
+quc_print_eject_human() {
+    case ${quc_eject_status:-skipped_policy} in
+        planned)
+            printf '%s\n' "Автоотключение назначения запланировано."
+            ;;
+        unmounted)
+            printf '%s\n' "Файловая система назначения размонтирована. Питание не отключалось."
+            ;;
+        power_off)
+            printf '%s\n' "Питание назначения отключено штатно."
+            ;;
+        skipped_policy)
+            printf '%s\n' "Автоотключение назначения не выполнялось."
+            ;;
+        unavailable)
+            printf '%s\n' "Средство отключения недоступно. Назначение оставлено подключённым."
+            ;;
+        refused)
+            printf '%s\n' "Система отказала в отключении. Назначение оставлено подключённым."
+            ;;
+        *)
+            printf '%s\n' "Результат отключения неизвестен. Не извлекайте накопитель вслепую."
+            ;;
+    esac
+}
+
 quc_print_human() {
     case $quc_copy_status in
         RUNNING|STARTING) printf '%s\n' "Копирование выполняется." ;;
@@ -5429,6 +5967,7 @@ quc_print_human() {
             ;;
     esac
     printf '%s\n' "Для извлечения используйте средства ОС."
+    quc_print_eject_human
     case ${quc_profile:-gentle} in
         gentle)
             printf '%s\n' "Режим: бережный. Задержки самой флешки возможны."
@@ -5795,6 +6334,12 @@ quc_cmd_resume() {
     quc_ended=''
     quc_phase=resume
     quc_token=$(quc_new_token)
+    if [ "${quc_eject_policy:-no}" = yes ]; then
+        case ${quc_eject_status:-} in
+            unmounted|power_off) ;;
+            *) quc_eject_status=planned ;;
+        esac
+    fi
     "$quc_bin_rm" -f -- "$quc_job_dir/ready" "$quc_job_dir/stop-requested" 2>/dev/null || true
     quc_save_state || exit 1
     quc_write_owner "$$" "$(quc_proc_starttime $$ || printf 0)" "$quc_token" "$quc_job_id" || exit 1
@@ -6040,6 +6585,8 @@ quc_volume_label() {
     fi
     printf '\n'
 }
+
+# --- Пользовательский интерфейс ---
 
 quc_collect_volumes() {
     out=$1
@@ -6378,6 +6925,12 @@ quc_menu_show_details() {
         done
     fi
     printf '%s\n' "Режим программы: бережный"
+    if [ "${quc_eject_policy:-no}" = yes ]; then
+        printf '%s\n' "Автоотключение назначения: включено"
+    else
+        printf '%s\n' "Автоотключение назначения: выключено"
+    fi
+    printf '%s\n' "Исходный накопитель остаётся подключённым."
 }
 
 quc_menu_show_confirm() {
@@ -6409,6 +6962,12 @@ quc_menu_show_confirm() {
         printf '%s\n' "Размещение: корень назначения"
     fi
     printf '%s\n' "Существующие имена не заменяются."
+    if [ "${quc_eject_policy:-no}" = yes ]; then
+        printf '%s\n' "Отключение назначения: включено"
+    else
+        printf '%s\n' "Отключение назначения: выключено"
+    fi
+    printf '%s\n' "Исходный накопитель остаётся подключённым."
     printf '%s\n' "$qm_verdict"
     if [ -n "$qm_reason" ]; then
         printf 'Причина: %s\n' "$qm_reason"
@@ -6421,6 +6980,11 @@ quc_menu_show_confirm() {
     printf '%s\n' "[3] Изменить выбор"
     if [ "$quc_preflight_ok" = 1 ] && [ "${quc_stage_offer:-0}" = 1 ]; then
         printf '%s\n' "[4] Сначала локальная копия"
+    fi
+    if [ "${quc_eject_policy:-no}" = yes ]; then
+        printf '%s\n' "[5] Оставить назначение подключённым"
+    else
+        printf '%s\n' "[5] Включить отключение назначения"
     fi
     printf '%s\n' "[0] Отмена"
     printf '%s\n' "Выбор:"
@@ -6513,6 +7077,7 @@ quc_cmd_interactive() {
             fi
         fi
         quc_note_pending_job
+        quc_eject_policy=yes
         while :; do
             quc_menu_show_confirm
             if ! quc_menu_read; then
@@ -6534,7 +7099,7 @@ quc_cmd_interactive() {
                         continue
                     fi
                     if [ "$quc_menu_answer" = 4 ] && [ "${quc_stage_offer:-0}" != 1 ]; then
-                        printf '%s\n' "Нужно 1, 2, 3 или 0."
+                        printf '%s\n' "Нужно 1, 2, 3, 5 или 0."
                         continue
                     fi
                     if quc_read_owner && quc_pid_is_worker "$quc_owner_pid" "$quc_owner_start" "$quc_jobs_dir/$quc_owner_job"; then
@@ -6554,11 +7119,18 @@ quc_cmd_interactive() {
                     fi
                     quc_launch_prepared
                     ;;
+                5)
+                    if [ "$quc_eject_policy" = yes ]; then
+                        quc_eject_policy=no
+                    else
+                        quc_eject_policy=yes
+                    fi
+                    ;;
                 *)
                     if [ "${quc_stage_offer:-0}" = 1 ]; then
-                        printf '%s\n' "Нужно 1, 2, 3, 4 или 0."
+                        printf '%s\n' "Нужно 1, 2, 3, 4, 5 или 0."
                     else
-                        printf '%s\n' "Нужно 1, 2, 3 или 0."
+                        printf '%s\n' "Нужно 1, 2, 3, 5 или 0."
                     fi
                     ;;
             esac
@@ -6772,6 +7344,8 @@ quc_print_compat() {
     printf '%s\n' "Успех команды не означает совместимость файловой системы."
 }
 
+# --- Диагностика и точка входа ---
+
 quc_cmd_doctor() {
     if [ "$#" -ne 0 ]; then
         printf '%s\n' "doctor не принимает аргументы." >&2
@@ -6872,6 +7446,11 @@ quc_cmd_doctor() {
     printf '%s\n' "Профиль gentle: nice 19 и ionice best-effort 7 только у своего процесса. Задержки флешки этим не отменяются."
     printf '%s\n' "Меню не обходит дерево файлов, пока не выбраны оба пути."
     printf '%s\n' "Уведомления других программ не отключаются. Своих окон и звуков нет."
+    if command -v udisksctl >/dev/null 2>&1; then
+        printf '%s\n' "udisksctl: есть, необязательная программа. Отключение назначения ею не обещается."
+    else
+        printf '%s\n' "udisksctl: нет. Автоотключение назначения недоступно, копирование от этого не зависит."
+    fi
     printf '%s\n' "Коды выхода: 0 принята, 1 отказ или сбой, 2 аргументы, 70 среда."
     printf '%s\n' "error_code: E_OK E_FAIL E_USAGE E_ENV E_REJECT E_NOJOB."
     printf '%s\n' "Этот запуск не подтверждает дистрибутив. Полный набор этой копии выполнялся на Pop!_OS 24.04. РЕД ОС, Fedora и RHEL не отмечены как проверенные."

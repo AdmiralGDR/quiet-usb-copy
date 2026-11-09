@@ -108,6 +108,13 @@ begin_test() {
     unset QUC_FILL_PAUSE
     unset QUC_FAKE_VOLUMES
     unset QUC_PTY_TIMEOUT
+    unset QUC_STUB_LOG
+    unset QUC_STUB_HELP_OK
+    unset QUC_STUB_UNMOUNT_RC
+    unset QUC_STUB_POWER_RC
+    unset QUC_STUB_INFO_RC
+    unset QUC_STUB_MSG
+    unset QUC_STUB_MOUNT
     unset LD_PRELOAD
     unset XDG_DATA_HOME
     unset NO_COLOR
@@ -138,6 +145,12 @@ end_test() {
 }
 
 run_case() {
+    if [ -n "${QUC_ONLY:-}" ]; then
+        case ",$QUC_ONLY," in
+            *",$1,"*) ;;
+            *) return 0 ;;
+        esac
+    fi
     begin_test "$1"
     shift
     "$@"
@@ -313,7 +326,7 @@ test_static() {
         bad=1
     fi
     run_quiet "$SH" "$SCRIPT" version
-    if [ "$quc_ec" -ne 0 ] || ! grep -q '^quiet-usb-copy 0.4.0-rc.5$' "$quc_out" || ! grep -q '^build 20261101.3$' "$quc_out"; then
+    if [ "$quc_ec" -ne 0 ] || ! grep -q '^quiet-usb-copy 0.4.0-rc.7$' "$quc_out" || ! grep -q '^build 20261108.2$' "$quc_out"; then
         echo "version output"
         cat "$quc_out" "$quc_err"
         bad=1
@@ -662,16 +675,20 @@ EOF
             diff_hit=1
         fi
     done < "$WORK/disks.txt"
+    # Пары разделов хоста зависят от железа. Нет пары — UNVERIFIED, не PASS:
+    # обязательная проверка ниже идёт на синтетическом /sys/class/block.
     if [ "$named" -ne 1 ] || [ "$same_hit" -ne 1 ] || [ "$diff_hit" -ne 1 ]; then
-        echo "disk pairs same=$same_hit diff=$diff_hit named=$named"
-        bad=1
+        echo "UNVERIFIED host-disk-pairs same=$same_hit diff=$diff_hit named=$named"
     fi
-    msg=$(quc_disk_pair_problem "$spec1" /dev/no-such-quc-disk-b)
-    rc=$?
-    if [ "$rc" -eq 0 ] || [ -z "$msg" ]; then
-        echo "half-identified pair accepted"
-        bad=1
+    if [ -n "$spec1" ]; then
+        msg=$(quc_disk_pair_problem "$spec1" /dev/no-such-quc-disk-b)
+        rc=$?
+        if [ "$rc" -eq 0 ] || [ -z "$msg" ]; then
+            echo "half-identified pair accepted"
+            bad=1
+        fi
     fi
+    unit_disk_fixture || bad=1
     by_spec=
     by_disk=
     other_spec=
@@ -1981,7 +1998,7 @@ test_T27() {
 test_dx() {
     bad=0
     run_quiet "$SH" "$SCRIPT" version
-    if [ "$quc_ec" -ne 0 ] || ! grep -q '^quiet-usb-copy 0.4.0-rc.5$' "$quc_out" || ! grep -q '^build 20261101.3$' "$quc_out"; then
+    if [ "$quc_ec" -ne 0 ] || ! grep -q '^quiet-usb-copy 0.4.0-rc.7$' "$quc_out" || ! grep -q '^build 20261108.2$' "$quc_out"; then
         echo "version"
         bad=1
     fi
@@ -2107,7 +2124,7 @@ test_UX01() {
         echo "menu slow first=$quc_pty_first"
         bad=1
     fi
-    if ! grep -q 'Quiet USB Copy' "$quc_out" || ! grep -q 'PRESENTATION' "$quc_out" || ! grep -q 'BACKUP' "$quc_out" || ! grep -q 'Направление:' "$quc_out" || ! grep -q 'Режим: прямой' "$quc_out" || ! grep -q 'Размещение: корень назначения' "$quc_out" || ! grep -q 'Вердикт: можно копировать с ограничением.' "$quc_out" || ! grep -q 'Существующие имена не заменяются.' "$quc_out" || ! grep -q 'Копирование запущено в фоне' "$quc_out"; then
+    if ! grep -q 'Quiet USB Copy' "$quc_out" || ! grep -q 'PRESENTATION' "$quc_out" || ! grep -q 'BACKUP' "$quc_out" || ! grep -q 'Направление:' "$quc_out" || ! grep -q 'Режим: прямой' "$quc_out" || ! grep -q 'Размещение: корень назначения' "$quc_out" || ! grep -q 'Отключение назначения: включено' "$quc_out" || ! grep -q 'Исходный накопитель остаётся подключённым.' "$quc_out" || ! grep -q 'Вердикт: можно копировать с ограничением.' "$quc_out" || ! grep -q 'Существующие имена не заменяются.' "$quc_out" || ! grep -q 'Копирование запущено в фоне' "$quc_out"; then
         echo "menu text"
         cat "$quc_out"
         bad=1
@@ -2584,6 +2601,67 @@ QUC_SOURCE_ONLY=1
 # shellcheck disable=SC1090
 . "$SCRIPT"
 unset QUC_SOURCE_ONLY
+
+# Синтетическое дерево /sys/class/block во вложенном mount namespace.
+# Настоящие диски не читаются и не трогаются.
+unit_disk_fixture() {
+    fx=$WORK/fake-sys
+    rm -rf "$fx"
+    # Цели ссылок внутри смонтированного каталога: .d/<диск>/<раздел>,
+    # как ../../devices/... в настоящем sysfs.
+    fd=$fx/block/.d
+    mkdir -p "$fd/qucfa/qucfa1" "$fd/qucfa/qucfa2" "$fd/qucfb/qucfb1" \
+        "$fd/dm-90/slaves" "$fd/dm-91/dm" "$fd/dm-92/slaves" || return 1
+    for p in qucfa/qucfa1 qucfa/qucfa2 qucfb/qucfb1; do
+        echo 1 > "$fd/$p/partition"
+        ln -s ".d/$p" "$fx/block/${p#*/}"
+    done
+    for d in qucfa qucfb dm-90 dm-91 dm-92; do
+        ln -s ".d/$d" "$fx/block/$d"
+    done
+    : > "$fd/dm-90/slaves/qucfb1"
+    echo crypt > "$fd/dm-91/dm/name"
+    : > "$fd/dm-92/slaves/qucfa1"
+    : > "$fd/dm-92/slaves/qucfb1"
+    QUC_SOURCE_ONLY=1 unshare --mount --propagation private "$SH" -c '
+        mount --bind "$1" /sys/class/block || { echo "fixture bind failed"; exit 1; }
+        . "$2"
+        quc_resolve_tools >/dev/null 2>&1 || true
+        bad=0
+        expect_name() {
+            got=$(quc_disk_name "$1" 0) || got=
+            [ "$got" = "$2" ] || { echo "fixture disk_name $1: got=[$got] want=[$2]"; bad=1; }
+        }
+        expect_name /dev/qucfa1 qucfa
+        expect_name /dev/qucfa2 qucfa
+        expect_name /dev/qucfb1 qucfb
+        expect_name /dev/qucfa qucfa
+        expect_name /dev/dm-90 qucfb
+        expect_name /dev/dm-91 ""
+        expect_name /dev/dm-92 ""
+        expect_name /dev/qucfz9 ""
+        msg=$(quc_disk_pair_problem /dev/qucfa1 /dev/qucfa2); rc=$?
+        case "$rc:$msg" in
+            1:*"одного физического диска"*) ;;
+            *) echo "fixture same disk allowed rc=$rc msg=$msg"; bad=1 ;;
+        esac
+        msg=$(quc_disk_pair_problem /dev/dm-90 /dev/qucfb1); rc=$?
+        case "$rc:$msg" in
+            1:*"одного физического диска"*) ;;
+            *) echo "fixture crypt-on-same-disk allowed rc=$rc msg=$msg"; bad=1 ;;
+        esac
+        msg=$(quc_disk_pair_problem /dev/qucfa1 /dev/qucfb1); rc=$?
+        [ "$rc" -eq 0 ] && [ -z "$msg" ] || { echo "fixture different disks rejected rc=$rc msg=$msg"; bad=1; }
+        for b in /dev/qucfz9 /dev/dm-91 /dev/dm-92; do
+            msg=$(quc_disk_pair_problem /dev/qucfa1 "$b"); rc=$?
+            case "$rc:$msg" in
+                1:*"не определён"*) ;;
+                *) echo "fixture unresolved pair accepted $b rc=$rc msg=$msg"; bad=1 ;;
+            esac
+        done
+        exit "$bad"
+    ' fixture "$fx/block" "$SCRIPT"
+}
 
 run_case U-static test_static
 run_case U-dx test_dx

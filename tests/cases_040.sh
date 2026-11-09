@@ -952,7 +952,7 @@ test_C04() {
         bad=1
     fi
     run_quiet "$SH" "$SCRIPT" version
-    if [ "$quc_ec" -ne 0 ] || ! grep -q '^quiet-usb-copy 0.4.0-rc.5$' "$quc_out" || ! grep -q '^build 20261101.3$' "$quc_out" || ! grep -q '^sha256=' "$quc_out"; then
+    if [ "$quc_ec" -ne 0 ] || ! grep -q '^quiet-usb-copy 0.4.0-rc.7$' "$quc_out" || ! grep -q '^build 20261108.2$' "$quc_out" || ! grep -q '^sha256=' "$quc_out"; then
         echo "version"
         cat "$quc_out"
         bad=1
@@ -1556,11 +1556,39 @@ test_F03() {
     printf 'KEEP\n' > "$f_dir/dest"
     printf 'NEW\n' > "$f_dir/src"
     f_sha=$(c40_sha "$f_dir/dest")
+    f_dino=$(stat -c '%i' "$f_dir/dest")
+    f_sino=$(stat -c '%i' "$f_dir/src")
     f_mv=$(PATH=$ORIG_PATH command -v mv) || { fail "mv"; return; }
     "$f_mv" -n -- "$f_dir/src" "$f_dir/dest"
     f_rc=$?
-    if [ "$f_rc" -eq 0 ] || [ "$(cat "$f_dir/dest")" != KEEP ] || [ ! -f "$f_dir/src" ] || [ "$(c40_sha "$f_dir/dest")" != "$f_sha" ]; then
-        echo "gnu mv -n rc=$f_rc"
+    # Код возврата mv -n при пропуске зависит от версии GNU coreutils
+    # (9.4 возвращает 1, 9.7 возвращает 0). Проверяется результат, а не код.
+    if [ "$(cat "$f_dir/dest")" != KEEP ] || [ "$(c40_sha "$f_dir/dest")" != "$f_sha" ] \
+        || [ "$(stat -c '%i' "$f_dir/dest")" != "$f_dino" ] \
+        || [ ! -f "$f_dir/src" ] || [ "$(cat "$f_dir/src")" != NEW ] \
+        || [ "$(stat -c '%i' "$f_dir/src")" != "$f_sino" ]; then
+        echo "gnu mv -n replaced or lost a file rc=$f_rc"
+        bad=1
+    fi
+    echo "gnu mv -n skip rc=$f_rc"
+    # Продукт: mv -n с кодом 0 без переноса (имя заняли между проверкой и mv)
+    # не считается публикацией и не трогает чужой файл.
+    f_rd=$WORK/t-$current/race
+    mkdir -p "$f_rd"
+    printf '#!/bin/sh\nprintf "FOREIGN\\n" > "%s/dst"\nexit 0\n' "$f_rd" > "$WORK/t-$current/mv-skip0"
+    printf '#!/bin/sh\nexit 1\n' > "$WORK/t-$current/ln-no"
+    chmod 755 "$WORK/t-$current/mv-skip0" "$WORK/t-$current/ln-no" || bad=1
+    printf 'PAYLOAD\n' > "$f_rd/tmp"
+    f_rino=$(stat -c '%i' "$f_rd/tmp")
+    quc_bin_ln=$WORK/t-$current/ln-no
+    quc_bin_mv=$WORK/t-$current/mv-skip0
+    quc_install_new "$f_rd/tmp" "$f_rd/dst" "$f_rino"
+    f_rc=$?
+    quc_resolve_tools || bad=1
+    if [ "$f_rc" -eq 0 ] || [ "$(cat "$f_rd/dst" 2>/dev/null)" != FOREIGN ] \
+        || [ "$(cat "$f_rd/tmp" 2>/dev/null)" != PAYLOAD ] \
+        || [ "$(stat -c '%i' "$f_rd/tmp" 2>/dev/null)" != "$f_rino" ]; then
+        echo "install treated mv -n rc=0 skip as success rc=$f_rc"
         bad=1
     fi
     f_bind_job || { fail "job"; return; }
@@ -2655,7 +2683,920 @@ test_S05() {
     if [ "$bad" -eq 0 ]; then pass; else fail "tampered source_dependency status=$st"; fi
 }
 
+g_stub_install() {
+    g_stub_dir=$WORK/t-$current/stubbin
+    g_stub_log=$WORK/t-$current/udisks.log
+    mkdir -p "$g_stub_dir"
+    : > "$g_stub_log"
+    cat > "$g_stub_dir/udisksctl" << 'EOF'
+#!/bin/sh
+log=${QUC_STUB_LOG:?}
+printf '%s\n' "$*" >> "$log"
+cmd=$1
+shift
+g_help=0
+case $cmd in
+    unmount|power-off|info) ;;
+    *) g_help=1 ;;
+esac
+for g_arg in "$@"; do
+    if [ "$g_arg" = --help ] || [ "$g_arg" = -h ]; then
+        g_help=1
+    fi
+    if [ "$g_arg" = --force ] || [ "$g_arg" = -f ]; then
+        printf '%s\n' "saw-force" >> "$log"
+        exit 1
+    fi
+done
+if [ "$g_help" = 1 ]; then
+    if [ "${QUC_STUB_HELP_OK:-1}" = 0 ]; then
+        printf '%s\n' "usage"
+        exit 0
+    fi
+    printf '%s\n' "--no-user-interaction"
+    exit 0
+fi
+case $cmd in
+    unmount)
+        if [ "${QUC_STUB_UNMOUNT_RC:-1}" = 0 ]; then
+            if [ -n "${QUC_STUB_MOUNT:-}" ]; then
+                umount "$QUC_STUB_MOUNT" || true
+            fi
+            exit 0
+        fi
+        printf '%s\n' "${QUC_STUB_MSG:-denied}" >&2
+        exit "${QUC_STUB_UNMOUNT_RC:-1}"
+        ;;
+    power-off)
+        exit "${QUC_STUB_POWER_RC:-1}"
+        ;;
+    info)
+        if [ "${QUC_STUB_INFO_RC:-1}" = 0 ]; then
+            printf '%s\n' "present"
+            exit 0
+        fi
+        printf '%s\n' "missing" >&2
+        exit "${QUC_STUB_INFO_RC:-1}"
+        ;;
+esac
+exit 1
+EOF
+    chmod 755 "$g_stub_dir/udisksctl"
+    PATH=$g_stub_dir:$ORIG_PATH
+    export QUC_STUB_LOG=$g_stub_log
+    export QUC_STUB_HELP_OK=1
+    export QUC_STUB_UNMOUNT_RC=1
+    export QUC_STUB_POWER_RC=1
+    export QUC_STUB_INFO_RC=1
+    export QUC_STUB_MSG=denied
+    unset QUC_STUB_MOUNT
+}
+
+g_stub_actions() {
+    if [ ! -f "${g_stub_log:-}" ]; then
+        printf '0\n'
+        return 0
+    fi
+    g_n=$(grep -c -E '^(unmount|power-off) -b ' "$g_stub_log" || true)
+    case $g_n in
+        ''|*[!0-9]*) g_n=0 ;;
+    esac
+    printf '%s\n' "$g_n"
+}
+
+test_G01() {
+    bad=0
+    g_stub_install
+    make_pair || { fail "mount"; return; }
+    printf 'plain\n' > "$src/a.txt"
+    run_start "$src" "$dst"
+    if [ "$quc_ec" -ne 0 ] || [ "$quc_noisy" -ne 0 ]; then
+        bad=1
+    fi
+    st=$(wait_done 40)
+    if [ "$st" != SUCCESS ] || [ "$(job_field eject_status)" != skipped_policy ] || [ "$(job_field eject_policy)" != no ]; then
+        echo "status=$st eject=$(job_field eject_status) policy=$(job_field eject_policy)"
+        bad=1
+    fi
+    if [ "$(g_stub_actions)" != 0 ] || grep -F -q -- "$src" "$g_stub_log"; then
+        echo "source or action in stub"
+        cat "$g_stub_log"
+        bad=1
+    fi
+    trees_ok "$src" "$dst" || bad=1
+    if [ "$bad" -eq 0 ]; then pass; else fail "cli does not eject"; fi
+}
+
+test_G02() {
+    bad=0
+    g_stub_install
+    make_pair || { fail "mount"; return; }
+    printf 'block\n' > "$src/a.txt"
+    run_start --eject-dest "$src" "$dst"
+    if [ "$quc_ec" -ne 0 ] || [ "$quc_noisy" -ne 0 ]; then
+        bad=1
+    fi
+    st=$(wait_done 40)
+    if [ "$st" != SUCCESS ] || [ "$(job_field eject_status)" != skipped_policy ] || [ "$(job_field eject_policy)" != yes ]; then
+        echo "status=$st eject=$(job_field eject_status) policy=$(job_field eject_policy)"
+        bad=1
+    fi
+    if [ "$(g_stub_actions)" != 0 ]; then
+        echo "tmpfs called udisksctl"
+        cat "$g_stub_log"
+        bad=1
+    fi
+    trees_ok "$src" "$dst" || bad=1
+    if [ "$bad" -eq 0 ]; then pass; else fail "eject-dest on non-block"; fi
+}
+
+test_G03() {
+    bad=0
+    g_stub_install
+    quc_resolve_tools || bad=1
+    quc_default_job_vars
+    quc_eject_policy=yes
+    quc_copy_status=RUNNING
+    quc_verify_status=size
+    quc_sync_status=command_ok
+    quc_error=marker
+    quc_auto_disconnect
+    if [ "$quc_eject_status" != skipped_policy ] || [ "$quc_copy_status" != RUNNING ] || [ "$quc_error" != marker ]; then
+        echo "running eject=$quc_eject_status copy=$quc_copy_status"
+        bad=1
+    fi
+    quc_copy_status=SUCCESS
+    quc_verify_status=failed
+    quc_auto_disconnect
+    if [ "$quc_eject_status" != skipped_policy ] || [ "$quc_copy_status" != SUCCESS ]; then
+        echo "verify eject=$quc_eject_status"
+        bad=1
+    fi
+    quc_verify_status=size
+    quc_sync_status=unconfirmed
+    quc_auto_disconnect
+    if [ "$quc_eject_status" != skipped_policy ]; then
+        echo "sync eject=$quc_eject_status"
+        bad=1
+    fi
+    quc_sync_status=command_ok
+    quc_eject_policy=no
+    quc_auto_disconnect
+    if [ "$quc_eject_status" != skipped_policy ] || [ "$(g_stub_actions)" != 0 ]; then
+        echo "policy called the tool"
+        cat "$g_stub_log"
+        bad=1
+    fi
+    if [ "$bad" -eq 0 ]; then pass; else fail "unsafe eject skipped"; fi
+}
+
+test_G04() {
+    bad=0
+    lim=$WORK/t-$current/bin
+    mkdir -p "$lim"
+    for tool in find stat awk od tr mkdir rmdir rm mv ln chmod date readlink sleep cat cp grep dirname basename cmp sync touch flock setsid nice nohup sha256sum sh; do
+        g_bin=$(PATH=$ORIG_PATH command -v "$tool" || true)
+        if [ -n "$g_bin" ]; then
+            ln -s "$g_bin" "$lim/$tool"
+        fi
+    done
+    if env PATH="$lim" command -v tar >/dev/null 2>&1 || env PATH="$lim" command -v gzip >/dev/null 2>&1 || env PATH="$lim" command -v udisksctl >/dev/null 2>&1; then
+        echo "optional tool leaked"
+        bad=1
+    fi
+    make_pair || { fail "mount"; return; }
+    printf 'still\n' > "$src/a.txt"
+    env PATH="$lim" "$SH" "$SCRIPT" start --eject-dest "$src" "$dst" >"$WORK/last.out" 2>"$WORK/last.err"
+    quc_ec=$?
+    if [ "$quc_ec" -ne 0 ] || [ -s "$WORK/last.out" ] || [ -s "$WORK/last.err" ]; then
+        echo "limited start ec=$quc_ec"
+        cat "$WORK/last.out" "$WORK/last.err"
+        bad=1
+    fi
+    st=$(wait_done 40)
+    if [ "$st" != SUCCESS ] || [ "$(job_field eject_status)" != unavailable ] || [ "$(job_field eject_policy)" != yes ]; then
+        echo "status=$st eject=$(job_field eject_status) sync=$(job_field sync_status)"
+        bad=1
+    fi
+    trees_ok "$src" "$dst" || bad=1
+    if [ "$bad" -eq 0 ]; then pass; else fail "missing udisksctl tar gzip"; fi
+}
+
+test_G05() {
+    bad=0
+    g_stub_install
+    export QUC_STUB_HELP_OK=0
+    quc_resolve_tools || bad=1
+    quc_default_job_vars
+    quc_eject_policy=yes
+    quc_copy_status=SUCCESS
+    quc_verify_status=checksum
+    quc_sync_status=command_ok
+    quc_error=kept
+    quc_auto_disconnect
+    if [ "$quc_eject_status" != unavailable ] || [ "$quc_copy_status" != SUCCESS ] || [ "$quc_error" != kept ]; then
+        echo "eject=$quc_eject_status copy=$quc_copy_status"
+        bad=1
+    fi
+    if [ "$(g_stub_actions)" != 0 ]; then
+        echo "help mode still called an action"
+        cat "$g_stub_log"
+        bad=1
+    fi
+    if ! grep -q 'unmount --help' "$g_stub_log"; then
+        echo "help was not probed"
+        cat "$g_stub_log"
+        bad=1
+    fi
+    if [ "$bad" -eq 0 ]; then pass; else fail "no noninteractive mode"; fi
+}
+
+test_G06() {
+    bad=0
+    g_stub_install
+    make_pair || { fail "mount"; return; }
+    printf 'busy\n' > "$dst/keep.txt"
+    quc_resolve_tools || bad=1
+    if ! quc_eject_tool_ready; then
+        echo "stub help rejected"
+        cat "$g_stub_log"
+        bad=1
+    fi
+    case $quc_bin_udisksctl in
+        "$g_stub_dir"/udisksctl) ;;
+        *) echo "tool=$quc_bin_udisksctl"; bad=1 ;;
+    esac
+    quc_target=$dst
+    quc_source_spec=/dev/loop0
+    quc_ej_mount_ok=1
+    quc_ej_block=/dev/loop0
+    quc_ej_disk=loop0
+    quc_ej_power_ok=0
+    quc_copy_status=SUCCESS
+    quc_eject_run </dev/null
+    if [ "$quc_eject_status" != skipped_policy ] || [ "$(g_stub_actions)" != 0 ]; then
+        echo "source block was not refused eject=$quc_eject_status"
+        cat "$g_stub_log"
+        bad=1
+    fi
+    quc_source_spec=/dev/quc-source-not-dest
+    export QUC_STUB_MSG=busy
+    quc_ej_mount_ok=1
+    quc_ej_block=/dev/loop0
+    quc_ej_power_ok=0
+    quc_eject_run </dev/null
+    if [ "$quc_eject_status" != refused ] || [ "$quc_copy_status" != SUCCESS ]; then
+        echo "busy eject=$quc_eject_status copy=$quc_copy_status"
+        bad=1
+    fi
+    if ! grep -q '^unmount -b /dev/loop0 --no-user-interaction$' "$g_stub_log" || grep -q -- '--force' "$g_stub_log"; then
+        echo "busy log"
+        cat "$g_stub_log"
+        bad=1
+    fi
+    if ! findmnt -n -T "$dst" >/dev/null 2>&1; then
+        echo "busy test unmounted the volume"
+        bad=1
+    fi
+    export QUC_STUB_MSG='Not authorized'
+    : > "$g_stub_log"
+    quc_ej_mount_ok=1
+    quc_ej_block=/dev/loop0
+    quc_eject_run </dev/null
+    if [ "$quc_eject_status" != refused ] || [ "$quc_copy_status" != SUCCESS ]; then
+        echo "auth eject=$quc_eject_status"
+        bad=1
+    fi
+    if ! findmnt -n -T "$dst" >/dev/null 2>&1; then
+        echo "auth test unmounted the volume"
+        bad=1
+    fi
+    if [ "$bad" -eq 0 ]; then pass; else fail "busy and auth refusal"; fi
+}
+
+test_G08() {
+    bad=0
+    g_stub_install
+    make_pair || { fail "mount"; return; }
+    printf 'gone\n' > "$dst/a.txt"
+    quc_resolve_tools || bad=1
+    if ! quc_eject_tool_ready; then
+        echo "tool"; bad=1
+    fi
+    case $quc_bin_udisksctl in
+        "$g_stub_dir"/udisksctl) ;;
+        *) echo "tool=$quc_bin_udisksctl"; bad=1 ;;
+    esac
+    export QUC_STUB_UNMOUNT_RC=0
+    export QUC_STUB_MOUNT=$dst
+    quc_target=$dst
+    quc_source_spec=/dev/quc-source-not-dest
+    quc_ej_mount_ok=1
+    quc_ej_block=/dev/loop0
+    quc_ej_disk=loop0
+    quc_ej_power_ok=0
+    quc_copy_status=SUCCESS
+    quc_eject_run </dev/null
+    if [ "$quc_eject_status" != unmounted ] || [ "$quc_copy_status" != SUCCESS ]; then
+        echo "eject=$quc_eject_status"
+        cat "$g_stub_log"
+        bad=1
+    fi
+    if grep -q '^power-off -b ' "$g_stub_log"; then
+        echo "power was called"
+        bad=1
+    fi
+    if findmnt -n -T "$dst" >/dev/null 2>&1; then
+        g_src=$(findmnt -n -o SOURCE -T "$dst" 2>/dev/null || true)
+        if [ "$g_src" = tmpfs ]; then
+            echo "tmpfs still mounted"
+            bad=1
+        fi
+    fi
+    if [ "$bad" -eq 0 ]; then pass; else fail "mock unmount"; fi
+}
+
+test_G09() {
+    bad=0
+    if [ ! -e /dev/loop0 ]; then
+        echo "loop0 missing"
+        bad=1
+    fi
+    g_stub_install
+    make_pair || { fail "mount"; return; }
+    g_sys=$WORK/t-$current/fakesys
+    g_loop_scope=$WORK/t-$current/loop-scope/host0/target0
+    g_sdz_scope=$WORK/t-$current/sdz-scope/host0/target0
+    mkdir -p "$g_sys/loop0/holders" "$g_sys/sdz/holders" "$g_sys/sdz/sdz1" "$g_sys/sdz/sdz2" \
+        "$g_sys/sdz-sib" "$g_loop_scope/lun0" "$g_sdz_scope/lun0" "$g_sdz_scope/lun1"
+    ln -s "$g_loop_scope/lun0" "$g_sys/loop0/device"
+    ln -s "$g_sdz_scope/lun0" "$g_sys/sdz/device"
+    ln -s "$g_sdz_scope/lun1" "$g_sys/sdz-sib/device"
+    printf '1\n' > "$g_sys/sdz/sdz1/partition"
+    printf '2\n' > "$g_sys/sdz/sdz2/partition"
+    ln -s "sdz/sdz1" "$g_sys/sdz1"
+    ln -s "sdz/sdz2" "$g_sys/sdz2"
+    printf 'x\n' > "$g_sys/sdz/holders/dm-0"
+    g_bound=0
+    if mount --bind "$g_sys" /sys/class/block; then
+        g_bound=1
+    else
+        echo "sysfs bind failed"
+        bad=1
+    fi
+    if [ "$g_bound" = 1 ]; then
+        quc_resolve_tools || bad=1
+        g_name=$(quc_disk_name /dev/sdz1 0 || true)
+        if [ "$g_name" != sdz ]; then
+            echo "disk_name=$g_name"
+            bad=1
+        fi
+        if quc_eject_power_clear sdz; then
+            echo "holders did not block power"
+            bad=1
+        fi
+        rm -f "$g_sys/sdz/holders/dm-0"
+        if quc_eject_power_clear sdz; then
+            echo "sibling lun did not block power"
+            bad=1
+        fi
+        quc_ej_block=/dev/sdz1
+        if ! quc_eject_same_disk /dev/sdz1 sdz; then
+            echo "exact block missed"
+            bad=1
+        fi
+        if ! quc_eject_same_disk /dev/sdz2 sdz; then
+            echo "sibling partition missed"
+            bad=1
+        fi
+        if quc_eject_foreign_live quc-not-a-disk /quc-not-mounted; then
+            echo "unknown disk looked foreign"
+            bad=1
+        fi
+        if ! quc_eject_tool_ready; then
+            echo "tool"; bad=1
+        fi
+        case $quc_bin_udisksctl in
+            "$g_stub_dir"/udisksctl) ;;
+            *) echo "tool=$quc_bin_udisksctl"; bad=1 ;;
+        esac
+        if quc_eject_power_clear loop0; then
+            export QUC_STUB_UNMOUNT_RC=0
+            export QUC_STUB_MOUNT=$dst
+            export QUC_STUB_POWER_RC=0
+            export QUC_STUB_INFO_RC=1
+            quc_target=$dst
+            quc_source_spec=/dev/quc-source-not-dest
+            quc_ej_mount_ok=1
+            quc_ej_block=/dev/loop0
+            quc_ej_disk=loop0
+            quc_ej_power_ok=1
+            quc_copy_status=SUCCESS
+            quc_eject_run </dev/null
+            if [ "$quc_eject_status" != power_off ]; then
+                echo "eject=$quc_eject_status"
+                cat "$g_stub_log"
+                bad=1
+            fi
+            if ! grep -q '^power-off -b /dev/loop0 --no-user-interaction$' "$g_stub_log"; then
+                echo "power log"
+                cat "$g_stub_log"
+                bad=1
+            fi
+            if grep -q 'info -b /dev/loop0 --no-user-interaction' "$g_stub_log" || grep -q -- '--force' "$g_stub_log"; then
+                echo "info flag or force"
+                cat "$g_stub_log"
+                bad=1
+            fi
+            if [ ! -e /dev/loop0 ]; then
+                echo "loop0 disappeared"
+                bad=1
+            fi
+        else
+            echo "loop0 power_clear refused"
+            bad=1
+        fi
+        umount /sys/class/block || bad=1
+    fi
+    if [ "$bad" -eq 0 ]; then pass; else fail "mock power and sibling disk"; fi
+}
+
+test_G10() {
+    bad=0
+    make_pair || { fail "mount"; return; }
+    quc_resolve_tools || bad=1
+    quc_target=$dst
+    quc_mountinfo_lookup "$dst" || { echo "lookup"; bad=1; }
+    quc_target_mntid=999999999
+    quc_target_dev=$(quc_dev_of "$dst" || true)
+    quc_target_uuid=
+    quc_source_spec=
+    quc_ej_power_tool=0
+    if quc_eject_gather; then
+        echo "changed id was accepted"
+        bad=1
+    fi
+    mkdir -p "$dst/sub"
+    quc_target=$dst/sub
+    if quc_eject_gather; then
+        echo "subdirectory was accepted"
+        bad=1
+    fi
+    quc_ej_block=/dev/loop0
+    if ! quc_eject_same_disk /dev/loop0 loop0; then
+        echo "same node"
+        bad=1
+    fi
+    if quc_eject_same_disk tmpfs loop0; then
+        echo "tmpfs matched a disk"
+        bad=1
+    fi
+    if [ "$bad" -eq 0 ]; then pass; else fail "identity and mount point"; fi
+}
+
+test_G12() {
+    bad=0
+    sleep 20 &
+    g_sleep=$!
+    if quc_eject_children_clear; then
+        echo "child was invisible"
+        cat /proc/$$/task/$$/children 2>/dev/null || true
+        bad=1
+    fi
+    kill "$g_sleep" 2>/dev/null || true
+    wait "$g_sleep" 2>/dev/null || true
+    if ! quc_eject_children_clear; then
+        echo "children remained"
+        cat /proc/$$/task/$$/children 2>/dev/null || true
+        bad=1
+    fi
+    quc_default_job_vars
+    quc_eject_policy=yes
+    quc_copy_status=SUCCESS
+    quc_verify_status=size
+    quc_sync_status=command_ok
+    sleep 20 &
+    g_sleep=$!
+    quc_auto_disconnect
+    kill "$g_sleep" 2>/dev/null || true
+    wait "$g_sleep" 2>/dev/null || true
+    if [ "$quc_eject_status" != skipped_policy ] || [ "$quc_copy_status" != SUCCESS ]; then
+        echo "child eject=$quc_eject_status"
+        bad=1
+    fi
+    if [ "$bad" -eq 0 ]; then pass; else fail "children block eject"; fi
+}
+
+test_G14() {
+    bad=0
+    g_stub_install
+    make_pair || { fail "mount"; return; }
+    printf 'one\n' > "$src/a.txt"
+    printf 'two\n' > "$src/b.txt"
+    export QUC_FILE_PAUSE=4
+    run_start --eject-dest "$src" "$dst"
+    if ! wait_phase pause 80; then
+        echo "phase=$(job_field phase)"
+        bad=1
+    fi
+    g_pid=$(c40_owner_pid)
+    case $g_pid in
+        ''|0|1|*[!0-9]*) echo "pid=$g_pid"; bad=1 ;;
+        *) kill -TERM "$g_pid" 2>/dev/null || bad=1 ;;
+    esac
+    st=$(wait_done 80)
+    if [ "$st" != INTERRUPTED ] || [ "$(job_field eject_status)" != skipped_policy ] || [ "$(job_field eject_policy)" != yes ]; then
+        echo "after term status=$st eject=$(job_field eject_status)"
+        bad=1
+    fi
+    if [ "$(g_stub_actions)" != 0 ]; then
+        echo "term called eject"
+        cat "$g_stub_log"
+        bad=1
+    fi
+    run_resume
+    if [ "$quc_ec" -ne 0 ] || [ "$quc_noisy" -ne 0 ]; then
+        echo "resume ec=$quc_ec"
+        bad=1
+    fi
+    if ! wait_phase pause 80; then
+        echo "resume phase=$(job_field phase) eject=$(job_field eject_status)"
+        bad=1
+    fi
+    if [ "$(job_field eject_status)" != planned ] || [ "$(job_field eject_policy)" != yes ]; then
+        echo "resume planned eject=$(job_field eject_status)"
+        bad=1
+    fi
+    st=$(wait_done 80)
+    if [ "$st" != SUCCESS ] || [ "$(job_field eject_status)" != skipped_policy ]; then
+        echo "final status=$st eject=$(job_field eject_status)"
+        bad=1
+    fi
+    if [ "$(g_stub_actions)" != 0 ]; then
+        echo "resume called eject"
+        cat "$g_stub_log"
+        bad=1
+    fi
+    trees_ok "$src" "$dst" || bad=1
+    if [ "$bad" -eq 0 ]; then pass; else fail "resume keeps policy"; fi
+}
+
+test_G15() {
+    bad=0
+    make_pair || { fail "mount"; return; }
+    printf 'stay\n' > "$src/a.txt"
+    run_start "$src" "$dst"
+    st=$(wait_done 40)
+    if [ "$st" != SUCCESS ]; then
+        echo "status=$st"
+        bad=1
+    fi
+    umount "$dst" || bad=1
+    run_quiet "$SH" "$SCRIPT" status --machine
+    if [ "$quc_ec" -ne 0 ] || ! grep -q '^copy_status=SUCCESS$' "$quc_out" || ! grep -q '^eject_status=skipped_policy$' "$quc_out" || ! grep -q '^eject_policy=no$' "$quc_out"; then
+        echo "status after unmount"
+        cat "$quc_out" "$quc_err"
+        bad=1
+    fi
+    if [ "$bad" -eq 0 ]; then pass; else fail "status after destination unmount"; fi
+}
+
+test_G16() {
+    bad=0
+    if grep -n -- '--force' "$SCRIPT" >/dev/null; then
+        echo "product contains --force"
+        bad=1
+    fi
+    quc_default_job_vars
+    quc_copy_status=SUCCESS
+    quc_verify_status=size
+    quc_sync_status=command_ok
+    quc_files_done=1
+    quc_files_total=1
+    quc_profile=gentle
+    for g_st in planned unmounted power_off skipped_policy unavailable refused unknown weird; do
+        quc_eject_status=$g_st
+        g_text=$(quc_print_human)
+        case $g_text in
+            *'можно извлекать'*|*'copy_status='*)
+                echo "bad human $g_st"
+                bad=1
+                ;;
+        esac
+        case $g_text in
+            *'Для извлечения используйте средства ОС.'*) ;;
+            *) echo "missing os line $g_st"; bad=1 ;;
+        esac
+    done
+    quc_eject_status=refused
+    g_text=$(quc_print_human)
+    case $g_text in
+        *'Система отказала в отключении. Назначение оставлено подключённым.'*) ;;
+        *) echo "refused text"; bad=1 ;;
+    esac
+    quc_eject_status=power_off
+    g_text=$(quc_print_human)
+    case $g_text in
+        *'Питание назначения отключено штатно.'*) ;;
+        *) echo "power text"; bad=1 ;;
+    esac
+    if [ "$bad" -eq 0 ]; then pass; else fail "human eject text"; fi
+}
+
+test_G17() {
+    bad=0
+    g_stub_install
+    make_pair || { fail "mount"; return; }
+    printf 'slide\n' > "$src/deck.txt"
+    fake=$WORK/t-$current/fake.tsv
+    fake_row "$src" ext4 tmpfs PRESENTATION 33554432 30000000 > "$fake"
+    fake_row "$dst" ext4 tmpfs BACKUP 67108864 65000000 >> "$fake"
+    export QUC_FAKE_VOLUMES=$fake
+    printf '1\n2\n5\n1\n' > "$WORK/t-$current/in"
+    pty_run "$WORK/t-$current/in" /bin/sh "$SCRIPT"
+    if [ "$quc_pty_rc" -ne 0 ] || [ "$quc_ec" != 0 ]; then
+        echo "pty ec=$quc_ec"
+        cat "$quc_out" "$quc_meta"
+        bad=1
+    fi
+    if ! grep -q 'Отключение назначения: включено' "$quc_out" || ! grep -q 'Отключение назначения: выключено' "$quc_out" || ! grep -q 'Исходный накопитель остаётся подключённым.' "$quc_out" || ! grep -q 'Копирование запущено в фоне' "$quc_out"; then
+        echo "toggle text"
+        cat "$quc_out"
+        bad=1
+    fi
+    if grep -q 'copy_status=' "$quc_out" || grep -q 'source_dependency=' "$quc_out"; then
+        echo "machine field on the menu"
+        bad=1
+    fi
+    st=$(wait_done 40)
+    if [ "$st" != SUCCESS ] || [ "$(job_field eject_policy)" != no ] || [ "$(job_field eject_status)" != skipped_policy ]; then
+        echo "status=$st policy=$(job_field eject_policy) eject=$(job_field eject_status)"
+        bad=1
+    fi
+    if [ "$(g_stub_actions)" != 0 ]; then
+        echo "toggle still ejected"
+        cat "$g_stub_log"
+        bad=1
+    fi
+    if [ "$bad" -eq 0 ]; then pass; else fail "menu can refuse eject"; fi
+}
+
+test_G18() {
+    bad=0
+    g_stub_install
+    make_pair || { fail "mount"; return; }
+    printf 'kill\n' > "$src/a.txt"
+    printf 'more\n' > "$src/b.txt"
+    export QUC_FILE_PAUSE=5
+    run_start --eject-dest "$src" "$dst"
+    if ! wait_phase pause 80; then
+        bad=1
+    fi
+    g_pid=$(c40_owner_pid)
+    case $g_pid in
+        ''|0|1|*[!0-9]*) echo "pid=$g_pid"; bad=1 ;;
+        *) kill -KILL "$g_pid" 2>/dev/null || bad=1 ;;
+    esac
+    sleep 0.3
+    if [ "$(job_field copy_status)" = SUCCESS ]; then
+        echo "SIGKILL became SUCCESS"
+        bad=1
+    fi
+    if [ "$(g_stub_actions)" != 0 ]; then
+        echo "kill called eject"
+        cat "$g_stub_log"
+        bad=1
+    fi
+    unset QUC_FILE_PAUSE
+    run_resume
+    if [ "$quc_ec" -ne 0 ] || [ "$quc_noisy" -ne 0 ]; then
+        echo "resume ec=$quc_ec"
+        bad=1
+    fi
+    st=$(wait_done 80)
+    if [ "$st" != SUCCESS ] || [ "$(job_field eject_status)" != skipped_policy ] || [ "$(job_field eject_policy)" != yes ]; then
+        echo "status=$st eject=$(job_field eject_status) policy=$(job_field eject_policy)"
+        bad=1
+    fi
+    if [ "$(g_stub_actions)" != 0 ]; then
+        echo "resume called eject"
+        cat "$g_stub_log"
+        bad=1
+    fi
+    trees_ok "$src" "$dst" || bad=1
+    if [ "$bad" -eq 0 ]; then pass; else fail "SIGKILL resume does not eject"; fi
+}
+
+test_G19() {
+    bad=0
+    g_stub_install
+    make_pair 8m 256k || { fail "mount"; return; }
+    printf 'small\n' > "$src/a.txt"
+    run_start --eject-dest "$src" "$dst"
+    st=$(wait_done 40)
+    if [ "$st" = SUCCESS ]; then
+        echo "tiny volume accepted a large file"
+        bad=1
+    fi
+    if [ "$(job_field eject_status)" != skipped_policy ] || [ "$(g_stub_actions)" != 0 ]; then
+        echo "enospc eject=$(job_field eject_status)"
+        cat "$g_stub_log"
+        bad=1
+    fi
+    if [ "$bad" -eq 0 ]; then pass; else fail "no space does not eject"; fi
+}
+
+test_G20() {
+    bad=0
+    make_pair 32m 32m || { fail "mount"; return; }
+    g_i=0
+    while [ "$g_i" -lt 200 ]; do
+        printf 'x\n' > "$src/f$g_i.txt"
+        g_i=$((g_i + 1))
+    done
+    run_start "$src" "$dst"
+    st=$(wait_done 120)
+    if [ "$st" != SUCCESS ] || [ "$(job_field eject_status)" != skipped_policy ]; then
+        echo "status=$st eject=$(job_field eject_status)"
+        bad=1
+    fi
+    trees_ok "$src" "$dst" || bad=1
+    g_left=$(find "${TMPDIR:-/tmp}" -maxdepth 1 \( -name 'quc-tbrc.*' -o -name 'quc-tberr.*' -o -name 'quc-ejcap.*' -o -name 'quc-ejrows.*' -o -name 'quc-ejlun.*' \) -print 2>/dev/null || true)
+    if [ -n "$g_left" ]; then
+        echo "temp left: $g_left"
+        bad=1
+    fi
+    if [ "$bad" -eq 0 ]; then pass; else fail "many files"; fi
+}
+
+test_G21() {
+    bad=0
+    make_pair 16m 16m || { fail "mount"; return; }
+    dd if=/dev/zero of="$src/wide.bin" bs=1024 count=2048 status=none 2>/dev/null || bad=1
+    run_start "$src" "$dst"
+    st=$(wait_done 40)
+    if [ "$st" != SUCCESS ]; then
+        echo "status=$st"
+        bad=1
+    fi
+    cmp -s "$src/wide.bin" "$dst/wide.bin" || bad=1
+    if [ "$bad" -eq 0 ]; then pass; else fail "large file"; fi
+}
+
+test_G23() {
+    bad=0
+    make_pair || { fail "mount"; return; }
+    printf 'cwd\n' > "$src/a.txt"
+    cd /tmp || bad=1
+    run_start "$src" "$dst"
+    cd "$WORK" || bad=1
+    st=$(wait_done 40)
+    if [ "$st" != SUCCESS ] || [ "$quc_ec" -ne 0 ]; then
+        echo "status=$st ec=$quc_ec"
+        bad=1
+    fi
+    trees_ok "$src" "$dst" || bad=1
+    if [ "$bad" -eq 0 ]; then pass; else fail "start from another directory"; fi
+}
+
+test_G24() {
+    bad=0
+    run_quiet "$SH" "$SCRIPT" start --eject
+    if [ "$quc_ec" -ne 2 ] || [ "$quc_out_n" != 0 ] || [ "$quc_err_n" != 0 ]; then
+        echo "ec=$quc_ec out=$quc_out_n err=$quc_err_n"
+        bad=1
+    fi
+    if [ "$bad" -eq 0 ]; then pass; else fail "unknown eject flag"; fi
+}
+
+test_G25() {
+    bad=0
+    g_old=$ROOT/rollback/0.4.0-rc.5/quiet_usb_copy.sh
+    if [ ! -f "$g_old" ]; then
+        # В опубликованном дереве нет rollback/: rc.5 берётся из истории git
+        # (коммит 1090f43) и сверяется с опубликованной суммой.
+        g_old=$WORK/t-$current/rc5.sh
+        mkdir -p "$WORK/t-$current"
+        if git -C "$ROOT" show 1090f43:quiet_usb_copy.sh > "$g_old" 2>/dev/null \
+            && [ "$(c40_sha "$g_old")" = 946e9d86c9508631fc5c00bd9b3c59b611dcb5e9611ef8c551be45b6340f2593 ]; then
+            :
+        else
+            rm -f "$g_old"
+        fi
+    fi
+    if [ ! -f "$g_old" ]; then
+        echo "missing rc.5"
+        bad=1
+    fi
+    src_a=$WORK/t-$current/src-a
+    dst_a=$WORK/t-$current/dst-a
+    src_b=$WORK/t-$current/src-b
+    dst_b=$WORK/t-$current/dst-b
+    mkdir -p "$src_a" "$dst_a" "$src_b" "$dst_b"
+    mount -t tmpfs -o size=16m tmpfs "$src_a" || bad=1
+    mount -t tmpfs -o size=16m tmpfs "$dst_a" || bad=1
+    mount -t tmpfs -o size=16m tmpfs "$src_b" || bad=1
+    mount -t tmpfs -o size=16m tmpfs "$dst_b" || bad=1
+    printf 'same\n' > "$src_a/a.txt"
+    printf 'same\n' > "$src_b/a.txt"
+    g_state=$XDG_STATE_HOME
+    g_run=$XDG_RUNTIME_DIR
+    export XDG_STATE_HOME=$WORK/t-$current/xdg-old
+    export XDG_RUNTIME_DIR=$WORK/t-$current/run-old
+    mkdir -p "$XDG_STATE_HOME" "$XDG_RUNTIME_DIR"
+    "$SH" "$g_old" start "$src_a" "$dst_a" >"$WORK/last.out" 2>"$WORK/last.err"
+    if [ "$?" -ne 0 ]; then
+        echo "old start"
+        bad=1
+    fi
+    g_old_st=$(wait_done 40)
+    g_old_copy=$(job_field copy_status || true)
+    g_old_verify=$(job_field verify_status || true)
+    g_old_sync=$(job_field sync_status || true)
+    g_old_done=$(job_field files_done || true)
+    g_old_mode=$(job_field source_mode || true)
+    export XDG_STATE_HOME=$WORK/t-$current/xdg-new
+    export XDG_RUNTIME_DIR=$WORK/t-$current/run-new
+    mkdir -p "$XDG_STATE_HOME" "$XDG_RUNTIME_DIR"
+    "$SH" "$SCRIPT" start "$src_b" "$dst_b" >"$WORK/last.out" 2>"$WORK/last.err"
+    if [ "$?" -ne 0 ]; then
+        echo "new start"
+        bad=1
+    fi
+    g_new_st=$(wait_done 40)
+    if [ "$g_old_st" != SUCCESS ] || [ "$g_new_st" != SUCCESS ]; then
+        echo "old=$g_old_st new=$g_new_st"
+        bad=1
+    fi
+    if [ "$g_old_copy" != "$(job_field copy_status)" ] || [ "$g_old_verify" != "$(job_field verify_status)" ] || [ "$g_old_sync" != "$(job_field sync_status)" ] || [ "$g_old_done" != "$(job_field files_done)" ] || [ "$g_old_mode" != "$(job_field source_mode)" ]; then
+        echo "fields diverged old=$g_old_copy/$g_old_verify/$g_old_sync/$g_old_done/$g_old_mode new=$(job_field copy_status)/$(job_field verify_status)/$(job_field sync_status)/$(job_field files_done)/$(job_field source_mode)"
+        bad=1
+    fi
+    if [ "$(job_field eject_status)" != skipped_policy ] || [ "$(job_field eject_policy)" != no ]; then
+        echo "new eject fields"
+        bad=1
+    fi
+    trees_ok "$src_a" "$dst_a" || bad=1
+    trees_ok "$src_b" "$dst_b" || bad=1
+    export XDG_STATE_HOME=$g_state
+    export XDG_RUNTIME_DIR=$g_run
+    if [ "$bad" -eq 0 ]; then pass; else fail "differential rc.5"; fi
+}
+
+test_G27() {
+    bad=0
+    g_stub_install
+    make_pair || { fail "mount"; return; }
+    printf 'KEEP\n' > "$dst/keep.txt"
+    g_keep=$(c40_sha "$dst/keep.txt")
+    printf 'fresh\n' > "$src/a.txt"
+    run_start --eject-dest --source-mode staged --dest-mode separate "$src" "$dst"
+    if [ "$quc_ec" -ne 0 ] || [ "$quc_noisy" -ne 0 ]; then
+        echo "start ec=$quc_ec"
+        bad=1
+    fi
+    st=$(wait_done 80)
+    g_rel=$(job_field dest_rel || true)
+    if [ "$st" != SUCCESS ] || [ "$(job_field stage_status)" != READY ] || [ "$(job_field eject_status)" != skipped_policy ] || [ "$(job_field eject_policy)" != yes ]; then
+        echo "status=$st stage=$(job_field stage_status) eject=$(job_field eject_status)"
+        bad=1
+    fi
+    cmp -s "$src/a.txt" "$dst/$g_rel/a.txt" || bad=1
+    if [ "$(c40_sha "$dst/keep.txt")" != "$g_keep" ] || [ -e "$dst/a.txt" ]; then
+        echo "separate placement"
+        bad=1
+    fi
+    if [ "$(g_stub_actions)" != 0 ]; then
+        echo "staged called eject"
+        cat "$g_stub_log"
+        bad=1
+    fi
+    if [ "$bad" -eq 0 ]; then pass; else fail "staged separate eject skipped"; fi
+}
+
 run_case S01 test_S01
 run_case S02 test_S02
 run_case S03 test_S03
 run_case S05 test_S05
+run_case G01 test_G01
+run_case G02 test_G02
+run_case G03 test_G03
+run_case G04 test_G04
+run_case G05 test_G05
+run_case G06 test_G06
+run_case G08 test_G08
+run_case G09 test_G09
+run_case G10 test_G10
+run_case G12 test_G12
+run_case G14 test_G14
+run_case G15 test_G15
+run_case G16 test_G16
+run_case G17 test_G17
+run_case G18 test_G18
+run_case G19 test_G19
+run_case G20 test_G20
+run_case G21 test_G21
+run_case G23 test_G23
+run_case G24 test_G24
+run_case G25 test_G25
+run_case G27 test_G27
