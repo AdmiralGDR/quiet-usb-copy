@@ -36,8 +36,8 @@ umask 077
 
 # --- Общие настройки и константы ---
 
-QUC_VERSION=0.4.0-rc.7
-QUC_BUILD=20261108.2
+QUC_VERSION=0.4.0-rc.10
+QUC_BUILD=20261112.3
 QUC_PARTIAL_PREFIX=.quc-partial.
 QUC_MAX_ATTEMPTS=3
 QUC_FAT_MAX=4294967295
@@ -621,6 +621,12 @@ quc_default_job_vars() {
     quc_write_root=''
     quc_write_ino=''
     quc_publish_limited=0
+    quc_publish_mode=
+    quc_dest_link_probe=UNKNOWN
+    quc_partial_rel_hex=
+    quc_partial_ino=
+    quc_partial_bytes=0
+    quc_partial_visible=0
     quc_mount_mark=0
     quc_mount_secret=''
     quc_eject_policy=no
@@ -794,6 +800,12 @@ quc_save_state() {
         printf 'job_phase=%s\n' "${quc_job_phase:-CREATED}"
         printf 'eject_policy=%s\n' "${quc_eject_policy:-no}"
         printf 'eject_status=%s\n' "${quc_eject_status:-skipped_policy}"
+        printf 'publish_mode=%s\n' "${quc_publish_mode:-}"
+        printf 'dest_link_probe=%s\n' "${quc_dest_link_probe:-UNKNOWN}"
+        printf 'partial_rel_hex=%s\n' "${quc_partial_rel_hex:-}"
+        printf 'partial_ino=%s\n' "${quc_partial_ino:-}"
+        printf 'partial_bytes=%s\n' "${quc_partial_bytes:-0}"
+        printf 'partial_visible=%s\n' "${quc_partial_visible:-0}"
     } > "$st_tmp" || return 1
     "$quc_bin_mv" -f -- "$st_tmp" "$st_file"
 }
@@ -912,6 +924,17 @@ quc_load_state() {
             job_phase) quc_job_phase=$val ;;
             eject_policy) quc_eject_policy=$val ;;
             eject_status) quc_eject_status=$val ;;
+            publish_mode) quc_publish_mode=$val ;;
+            dest_link_probe) quc_dest_link_probe=$val ;;
+            partial_rel_hex) quc_partial_rel_hex=$val ;;
+            partial_ino) quc_partial_ino=$val ;;
+            partial_bytes) quc_partial_bytes=$(quc_norm_uint "$val") ;;
+            partial_visible)
+                case $val in
+                    0|1) quc_partial_visible=$val ;;
+                    *) quc_partial_visible=0 ;;
+                esac
+                ;;
         esac
     done < "$file"
     case $quc_sync_status in
@@ -953,6 +976,25 @@ quc_load_state() {
     case ${quc_eject_status:-} in
         planned|unmounted|power_off|skipped_policy|unavailable|refused|unknown) ;;
         *) quc_eject_status=unknown ;;
+    esac
+    case ${quc_publish_mode:-} in
+        link|exclusive) ;;
+        *) quc_publish_mode= ;;
+    esac
+    case ${quc_dest_link_probe:-} in
+        link|exclusive|unsupported|UNKNOWN) ;;
+        *) quc_dest_link_probe=UNKNOWN ;;
+    esac
+    case ${quc_partial_rel_hex:-} in
+        ''|*[!0-9A-Fa-f]*) quc_partial_rel_hex= ;;
+    esac
+    case ${quc_partial_ino:-} in
+        ''|*[!0-9]*) quc_partial_ino= ;;
+    esac
+    quc_partial_bytes=$(quc_norm_uint "${quc_partial_bytes:-0}")
+    case ${quc_partial_visible:-} in
+        0|1) ;;
+        *) quc_partial_visible=0 ;;
     esac
     case $quc_dest_rel in
         ''|*[!A-Za-z0-9._-]*) quc_dest_rel='' ;;
@@ -1459,9 +1501,22 @@ quc_tree_bytes() {
     printf '%s\n' "$tb_sum"
 }
 
-quc_fat_limit() {
+# fat — имена Windows и предел 4 ГиБ. exfat и ntfs — те же имена без этого предела.
+# posix — отдельная проверка имён не нужна. other — тип не из этого списка.
+# fuseblk не отличает NTFS от другой FUSE-системы: предел 4 ГиБ к нему не применяется.
+quc_name_class() {
     case $1 in
-        vfat|msdos|fat|msdosfs) printf '%s\n' "$QUC_FAT_MAX" ;;
+        vfat|msdos|fat|msdosfs) printf '%s\n' fat ;;
+        exfat) printf '%s\n' exfat ;;
+        ntfs|ntfs3|fuseblk) printf '%s\n' ntfs ;;
+        ext2|ext3|ext4|btrfs|xfs|tmpfs|f2fs|'') printf '%s\n' posix ;;
+        *) printf '%s\n' other ;;
+    esac
+}
+
+quc_fat_limit() {
+    case $(quc_name_class "$1") in
+        fat) printf '%s\n' "$QUC_FAT_MAX" ;;
         *) printf '\n' ;;
     esac
 }
@@ -1493,8 +1548,8 @@ quc_fat_component_bad() {
 quc_fat_name_bad() {
     fn_fs=$1
     fn_name=$2
-    case $fn_fs in
-        vfat|msdos|fat|msdosfs) ;;
+    case $(quc_name_class "$fn_fs") in
+        fat|exfat|ntfs) ;;
         *) return 1 ;;
     esac
     fn_rest=$fn_name
@@ -1512,6 +1567,166 @@ quc_fat_name_bad() {
         fi
     done
     return 1
+}
+
+# Правила компонента те же, что в quc_fat_component_bad. Расхождение — дефект.
+# Регистр сравнивается только для ASCII: tolower в локали C.
+# Юникодное совпадение регистра этой проверкой не обещается.
+# Обход не меняет источник и не создаёт имён в назначении.
+# Отказ обхода запрещает старт. Проверка одного файла при копировании остаётся.
+quc_scan_win_names() {
+    sn_root=$1
+    quc_name_bad=0
+    quc_name_fold=0
+    quc_name_links=0
+    quc_name_sample=
+    quc_name_fold_sample=
+    if [ -z "$sn_root" ] || [ -L "$sn_root" ] || [ ! -d "$sn_root" ]; then
+        return 1
+    fi
+    if [ -z "${quc_bin_find:-}" ] || [ -z "${quc_bin_awk:-}" ] || [ -z "${quc_bin_cat:-}" ]; then
+        return 1
+    fi
+    sn_rc_file=${TMPDIR:-/tmp}/quc-nrc.$$
+    "$quc_bin_rm" -f -- "$sn_rc_file" 2>/dev/null || true
+    sn_line=$(
+        cd -- "$sn_root" || exit 1
+        {
+            "$quc_bin_find" . -xdev -mindepth 1 -print0
+            echo $? > "$sn_rc_file"
+        } | LC_ALL=C "$quc_bin_awk" '
+BEGIN { RS = "\0"; bad = 0; fold = 0; sample = ""; fsample = "" }
+function badcomp(s,    n, i, c, o, u, last) {
+    n = length(s)
+    if (n == 0 || n > 255) return 1
+    if (index(s, "\n") > 0 || index(s, "\r") > 0) return 1
+    last = substr(s, n, 1)
+    if (last == " " || last == ".") return 1
+    for (i = 1; i <= n; i++) {
+        c = substr(s, i, 1)
+        if (c ~ /[<>:"\\|?*]/) return 1
+        o = index("\001\002\003\004\005\006\007\010\011\012\013\014\015\016\017\020\021\022\023\024\025\026\027\030\031\032\033\034\035\036\037\177", c)
+        if (o > 0) return 1
+    }
+    u = toupper(s)
+    sub(/\..*$/, "", u)
+    if (u ~ /^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$/) return 1
+    return 0
+}
+{
+    p = $0
+    sub(/^\.\//, "", p)
+    if (p == "" || p == ".") next
+    rest = p
+    nbad = 0
+    while (rest != "") {
+        slash = index(rest, "/")
+        if (slash > 0) {
+            part = substr(rest, 1, slash - 1)
+            rest = substr(rest, slash + 1)
+        } else {
+            part = rest
+            rest = ""
+        }
+        if (part == "" || part == ".") continue
+        if (badcomp(part)) nbad = 1
+    }
+    if (nbad == 1) {
+        bad++
+        if (sample == "") sample = p
+    }
+    key = tolower(p)
+    if ((key in seen) && seen[key] != p) {
+        fold++
+        if (fsample == "") fsample = seen[key] " и " p
+    } else if (!(key in seen)) {
+        seen[key] = p
+    }
+}
+END {
+    gsub(/\n/, "?", sample)
+    gsub(/\r/, "?", sample)
+    gsub(/\n/, "?", fsample)
+    gsub(/\r/, "?", fsample)
+    print bad + 0
+    print fold + 0
+    print sample
+    print fsample
+}
+'
+    ) || {
+        "$quc_bin_rm" -f -- "$sn_rc_file" 2>/dev/null || true
+        return 1
+    }
+    sn_rc=1
+    if [ -f "$sn_rc_file" ]; then
+        sn_rc=$("$quc_bin_cat" "$sn_rc_file" 2>/dev/null || printf '1\n')
+    fi
+    sn_link_line=$(
+        cd -- "$sn_root" || exit 1
+        "$quc_bin_find" . -xdev -mindepth 1 -type l -print0 |
+            LC_ALL=C "$quc_bin_awk" 'BEGIN { RS = "\0"; n = 0 } $0 != "" { n++ } END { print n + 0 }'
+    ) || sn_link_line=
+    "$quc_bin_rm" -f -- "$sn_rc_file" 2>/dev/null || true
+    case $sn_rc in
+        0) ;;
+        *) return 1 ;;
+    esac
+    sn_bad=$(printf '%s\n' "$sn_line" | "$quc_bin_awk" 'NR == 1 { print; exit }')
+    sn_fold=$(printf '%s\n' "$sn_line" | "$quc_bin_awk" 'NR == 2 { print; exit }')
+    sn_sample=$(printf '%s\n' "$sn_line" | "$quc_bin_awk" 'NR == 3 { print; exit }')
+    sn_fsample=$(printf '%s\n' "$sn_line" | "$quc_bin_awk" 'NR == 4 { print; exit }')
+    case $sn_bad in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    case $sn_fold in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    case $sn_link_line in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    quc_name_bad=$sn_bad
+    quc_name_fold=$sn_fold
+    quc_name_links=$sn_link_line
+    quc_name_sample=$sn_sample
+    quc_name_fold_sample=$sn_fsample
+    return 0
+}
+
+# Вызывается только для fat, exfat и ntfs. На posix ничего не обходит.
+# Несовместимое имя и совпадение регистра запрещают старт.
+# Символьная ссылка на FAT и exFAT объясняется заранее и не становится SUCCESS.
+quc_apply_name_policy() {
+    case $(quc_name_class "${quc_target_fs:-}") in
+        fat|exfat|ntfs) ;;
+        *) return 0 ;;
+    esac
+    if ! quc_scan_win_names "$quc_source"; then
+        quc_add_problem "не удалось проверить имена до запуска. Копирование не начато."
+        return 0
+    fi
+    if quc_cmp_num "$quc_name_bad" 0 gt; then
+        if [ -n "$quc_name_sample" ]; then
+            quc_add_problem "имён, которые это назначение не сохранит: $quc_name_bad. Пример: $(quc_display_path "$quc_name_sample"). Копирование не начато."
+        else
+            quc_add_problem "имён, которые это назначение не сохранит: $quc_name_bad. Копирование не начато."
+        fi
+    fi
+    if quc_cmp_num "$quc_name_fold" 0 gt; then
+        if [ -n "$quc_name_fold_sample" ]; then
+            quc_add_problem "имён, совпадающих без учёта регистра: $quc_name_fold. Пример: $(quc_display_path "$quc_name_fold_sample"). На этом назначении они станут одним именем. Копирование не начато."
+        else
+            quc_add_problem "имён, совпадающих без учёта регистра: $quc_name_fold. На этом назначении они станут одним именем. Копирование не начато."
+        fi
+    fi
+    case $(quc_name_class "${quc_target_fs:-}") in
+        fat|exfat)
+            if quc_cmp_num "$quc_name_links" 0 gt; then
+                quc_add_note "символьных ссылок: $quc_name_links. На FAT и exFAT они не сохраняются, итог не будет SUCCESS."
+            fi
+            ;;
+    esac
+    return 0
 }
 
 quc_hash_tool() {
@@ -1732,11 +1947,20 @@ quc_validate_pair() {
                     extra = need * 0.1
                     if (extra < 1048576) extra = 1048576
                 }
-                if (have >= need + extra) print "yes"; else print "no"
+                req = need + extra
+                if (have >= req) print "yes"
+                else printf "no %.0f\n", req
             }')
-            if [ "$ok" != yes ]; then
-                quc_add_problem "недостаточно свободного места (нужно около $(quc_human_bytes "$need"), доступно $(quc_human_bytes "$have"))"
-            fi
+            case $ok in
+                yes) ;;
+                no\ *)
+                    sp_req=${ok#no }
+                    quc_add_problem "недостаточно свободного места (нужно около $(quc_human_bytes "$sp_req") с запасом, доступно $(quc_human_bytes "$have"))"
+                    ;;
+                *)
+                    quc_add_problem "недостаточно свободного места"
+                    ;;
+            esac
         fi
         lim=$(quc_fat_limit "$quc_target_fs")
         if [ -n "$lim" ]; then
@@ -1745,6 +1969,7 @@ quc_validate_pair() {
                 quc_add_note "файлов больше предела FAT32 ($too): они не будут скопированы, итог не будет SUCCESS"
             fi
         fi
+        quc_apply_name_policy
     fi
     if [ "$mode" = fresh ] || [ "$mode" = separate ]; then
         probe=$quc_target/$QUC_PARTIAL_PREFIX"write-probe.$$"
@@ -1995,15 +2220,671 @@ quc_write_exclusive() {
     return 0
 }
 
-# Новое имя: ln без -L, затем mv -n. Принудительного mv нет.
-# Нулевой код mv -n не доказывает перенос: BusyBox оставляет оба файла.
-# После ln или mv назначение должно иметь тот же inode, что и временный файл.
+# Снимает поля незавершённого конечного имени. Сам файл не удаляет.
+quc_partial_clear() {
+    quc_partial_rel_hex=
+    quc_partial_ino=
+    quc_partial_bytes=0
+    quc_partial_visible=0
+}
+
+# Запоминает видимый незавершённый файл только если inode всё ещё наш.
+# Не удаляет имя и не объявляет содержимое проверенным.
+quc_partial_remember() {
+    pr_path=$1
+    pr_hex=$2
+    pr_ino=$3
+    if [ -z "$pr_ino" ] || [ -z "$pr_hex" ]; then
+        return 0
+    fi
+    if [ -L "$pr_path" ] || [ ! -f "$pr_path" ]; then
+        return 0
+    fi
+    pr_now=$("$quc_bin_stat" -c '%i' -- "$pr_path" 2>/dev/null || true)
+    if [ -z "$pr_now" ] || [ "$pr_now" != "$pr_ino" ]; then
+        return 0
+    fi
+    pr_sz=$(quc_file_size "$pr_path" || true)
+    case $pr_sz in
+        ''|*[!0-9]*) pr_sz=0 ;;
+    esac
+    quc_partial_rel_hex=$pr_hex
+    quc_partial_ino=$pr_ino
+    quc_partial_bytes=$pr_sz
+    quc_partial_visible=1
+    quc_note_owned "$pr_ino"
+    quc_save_state || true
+    return 0
+}
+
+# Удаляет только обычный файл с тем же inode. Ссылку и чужой inode не трогает.
+quc_probe_drop() {
+    pd_path=$1
+    pd_ino=$2
+    if [ -z "$pd_path" ] || [ -L "$pd_path" ] || [ ! -f "$pd_path" ]; then
+        return 0
+    fi
+    quc_drop_owned "$pd_path" "$pd_ino"
+    return 0
+}
+
+quc_probe_fds_close() {
+    if [ "${quc_probe_fd3:-0}" = 1 ]; then
+        exec 3>&-
+        quc_probe_fd3=0
+    fi
+    if [ "${quc_probe_fd4:-0}" = 1 ]; then
+        exec 4>&-
+        quc_probe_fd4=0
+    fi
+}
+
+# Закрывает дескрипторы пробы и снимает эталон. Вызывается после cmp.
+quc_probe_cleanup() {
+    quc_probe_fds_close
+    if [ -n "${quc_probe_ref:-}" ] && [ -n "${quc_bin_rm:-}" ]; then
+        "$quc_bin_rm" -f -- "$quc_probe_ref" 2>/dev/null || true
+    fi
+    quc_probe_ref=
+}
+
+# Проверяет назначение в этом процессе. link — жёсткая ссылка создаёт имя.
+# exclusive — повторное создание того же имени не затирает файл, ссылки нет.
+# Такой файл виден до конца записи и не является атомарной публикацией.
+# unsupported — копирование не начинается. Права каталога доказательством не служат.
+# Успех: 0 и режим link или exclusive. Отказ: 1, режим пуст.
+# Без cmp проба не выполняется: это не отказ файловой системы.
+quc_select_publish_mode_run() {
+    sp_dir=$1
+    quc_publish_mode=
+    quc_dest_link_probe='unsupported'
+    quc_probe_fd3=0
+    quc_probe_fd4=0
+    quc_probe_ref=
+    quc_error=
+    if [ -z "$sp_dir" ] || [ -L "$sp_dir" ] || [ ! -d "$sp_dir" ]; then
+        quc_error="На этом назначении нельзя создать новое имя без риска замены. Копирование не начато."
+        quc_probe_fds_close
+        return 1
+    fi
+    if [ -z "${quc_bin_cmp:-}" ]; then
+        quc_publish_mode=
+        quc_dest_link_probe=UNKNOWN
+        quc_error=
+        return 0
+    fi
+    if [ -z "${quc_bin_stat:-}" ] || [ -z "${quc_bin_ln:-}" ] || [ -z "${quc_state_dir:-}" ] || [ -L "$quc_state_dir" ] || [ ! -d "$quc_state_dir" ]; then
+        quc_error="На этом назначении нельзя создать новое имя без риска замены. Копирование не начато."
+        quc_probe_fds_close
+        return 1
+    fi
+    sp_n=0
+    sp_name=
+    while [ "$sp_n" -lt 8 ]; do
+        sp_n=$((sp_n + 1))
+        sp_try=$sp_dir/${QUC_PARTIAL_PREFIX}mode.$$.$sp_n
+        if [ ! -e "$sp_try" ] && [ ! -L "$sp_try" ]; then
+            sp_name=$sp_try
+            break
+        fi
+    done
+    if [ -z "$sp_name" ]; then
+        quc_error="На этом назначении нельзя создать новое имя без риска замены. Копирование не начато."
+        quc_probe_fds_close
+        return 1
+    fi
+    quc_probe_ref=$quc_state_dir/.quc-probe-byte.$$
+    if ! printf 'Q\n' > "$quc_probe_ref"; then
+        quc_error="На этом назначении нельзя создать новое имя без риска замены. Копирование не начато."
+        quc_probe_fds_close
+        return 1
+    fi
+    set -C
+    if exec 3>"$sp_name"; then
+        quc_probe_fd3=1
+    fi
+    set +C
+    if [ "$quc_probe_fd3" != 1 ]; then
+        quc_error="На этом назначении нельзя создать новое имя без риска замены. Копирование не начато."
+        quc_probe_fds_close
+        return 1
+    fi
+    sp_ino=$("$quc_bin_stat" -L -c '%i' /proc/self/fd/3 2>/dev/null || true)
+    case $sp_ino in
+        ''|*[!0-9]*)
+            quc_error="На этом назначении нельзя создать новое имя без риска замены. Копирование не начато."
+            quc_probe_fds_close
+            quc_probe_drop "$sp_name" "$sp_ino"
+            return 1
+            ;;
+    esac
+    if ! printf 'Q\n' >&3; then
+        quc_error="На этом назначении нельзя создать новое имя без риска замены. Копирование не начато."
+        quc_probe_fds_close
+        quc_probe_drop "$sp_name" "$sp_ino"
+        return 1
+    fi
+    quc_probe_fds_close
+    sp_now=$("$quc_bin_stat" -c '%i' -- "$sp_name" 2>/dev/null || true)
+    if [ -L "$sp_name" ] || [ ! -f "$sp_name" ] || [ -z "$sp_now" ] || [ "$sp_now" != "$sp_ino" ]; then
+        quc_error="На этом назначении нельзя создать новое имя без риска замены. Копирование не начато."
+        quc_probe_drop "$sp_name" "$sp_ino"
+        return 1
+    fi
+    if [ -z "${quc_bin_cmp:-}" ] || ! "$quc_bin_cmp" -s -- "$quc_probe_ref" "$sp_name"; then
+        quc_error="На этом назначении нельзя создать новое имя без риска замены. Копирование не начато."
+        quc_probe_drop "$sp_name" "$sp_ino"
+        quc_probe_fds_close
+        return 1
+    fi
+    # Повторное открытие того же имени должно быть отвергнуто. Ошибка
+    # перенаправления у exec завершает dash, поэтому проверка идёт в подоболочке.
+    # Успех подоболочки значит, что имя можно заменить: режим небезопасен.
+    if (set -C; exec 4>"$sp_name") >/dev/null 2>&1; then
+        quc_probe_fds_close
+        sp_now=$("$quc_bin_stat" -c '%i' -- "$sp_name" 2>/dev/null || true)
+        if [ -n "$sp_now" ] && [ "$sp_now" = "$sp_ino" ] && [ ! -L "$sp_name" ]; then
+            quc_probe_drop "$sp_name" "$sp_ino"
+        fi
+        quc_error="На этом назначении нельзя создать новое имя без риска замены. Копирование не начато."
+        quc_probe_fds_close
+        return 1
+    fi
+    sp_now=$("$quc_bin_stat" -c '%i' -- "$sp_name" 2>/dev/null || true)
+    if [ -L "$sp_name" ] || [ "$sp_now" != "$sp_ino" ] || ! "$quc_bin_cmp" -s -- "$quc_probe_ref" "$sp_name"; then
+        if [ -n "$sp_now" ] && [ "$sp_now" = "$sp_ino" ] && [ ! -L "$sp_name" ]; then
+            quc_probe_drop "$sp_name" "$sp_ino"
+        fi
+        quc_error="На этом назначении нельзя создать новое имя без риска замены. Копирование не начато."
+        quc_probe_fds_close
+        return 1
+    fi
+    sp_link=$sp_dir/${QUC_PARTIAL_PREFIX}ln.$$.$sp_n
+    if [ -e "$sp_link" ] || [ -L "$sp_link" ]; then
+        quc_probe_drop "$sp_name" "$sp_ino"
+        quc_error="На этом назначении нельзя создать новое имя без риска замены. Копирование не начато."
+        quc_probe_fds_close
+        return 1
+    fi
+    if "$quc_bin_ln" -- "$sp_name" "$sp_link" 2>/dev/null; then
+        sp_li=$("$quc_bin_stat" -c '%i' -- "$sp_link" 2>/dev/null || true)
+        if [ -n "$sp_li" ] && [ "$sp_li" = "$sp_ino" ] && [ ! -L "$sp_link" ]; then
+            quc_probe_drop "$sp_link" "$sp_ino"
+            quc_probe_drop "$sp_name" "$sp_ino"
+            quc_probe_fds_close
+            if [ -e "$sp_name" ] || [ -L "$sp_name" ] || [ -e "$sp_link" ] || [ -L "$sp_link" ]; then
+                quc_error="На этом назначении нельзя создать новое имя без риска замены. Копирование не начато."
+                return 1
+            fi
+            quc_publish_mode='link'
+            quc_dest_link_probe='link'
+            quc_error=
+            return 0
+        fi
+        quc_probe_drop "$sp_name" "$sp_ino"
+        quc_error="На этом назначении нельзя создать новое имя без риска замены. Копирование не начато."
+        quc_probe_fds_close
+        return 1
+    fi
+    if [ -e "$sp_link" ] || [ -L "$sp_link" ]; then
+        quc_probe_drop "$sp_name" "$sp_ino"
+        quc_error="На этом назначении нельзя создать новое имя без риска замены. Копирование не начато."
+        quc_probe_fds_close
+        return 1
+    fi
+    if [ -z "${quc_bin_cmp:-}" ]; then
+        quc_probe_drop "$sp_name" "$sp_ino"
+        quc_error="На этом назначении нельзя создать новое имя без риска замены. Копирование не начато."
+        quc_probe_fds_close
+        return 1
+    fi
+    quc_probe_drop "$sp_name" "$sp_ino"
+    quc_probe_fds_close
+    if [ -e "$sp_name" ] || [ -L "$sp_name" ]; then
+        quc_error="На этом назначении нельзя создать новое имя без риска замены. Копирование не начато."
+        return 1
+    fi
+    quc_publish_mode='exclusive'
+    quc_dest_link_probe='exclusive'
+    quc_error=
+    return 0
+}
+
+# Эталон сравнения живёт до возврата: внутренние закрытия дескрипторов его не стирают.
+quc_select_publish_mode() {
+    quc_select_publish_mode_run "$1"
+    sp_rc=$?
+    quc_probe_cleanup
+    return "$sp_rc"
+}
+
+# Пишет метку сразу в конечное имя. Файл виден до проверки и не заменяет чужое.
+quc_mark_place_exclusive() {
+    mx_live=$1
+    if [ -L "$mx_live" ]; then
+        quc_error="метка назначения является символьной ссылкой"
+        return 1
+    fi
+    if [ -e "$mx_live" ]; then
+        if quc_mount_mark_matches "$mx_live"; then
+            quc_mount_mark_accept
+            return $?
+        fi
+        quc_error="метка назначения уже занята другим объектом"
+        return 1
+    fi
+    set -C
+    mx_open=0
+    if exec 3>"$mx_live"; then
+        mx_open=1
+    fi
+    set +C
+    if [ "$mx_open" != 1 ]; then
+        if quc_mount_mark_matches "$mx_live"; then
+            quc_mount_mark_accept
+            return $?
+        fi
+        quc_error="не удалось закрепить метку назначения"
+        return 1
+    fi
+    mx_ino=$("$quc_bin_stat" -L -c '%i' /proc/self/fd/3 2>/dev/null || true)
+    case $mx_ino in
+        ''|*[!0-9]*)
+            exec 3>&-
+            quc_error="не удалось закрепить метку назначения"
+            return 1
+            ;;
+    esac
+    if ! printf '%s\n' "$quc_mount_secret" >&3; then
+        exec 3>&-
+        quc_probe_drop "$mx_live" "$mx_ino"
+        quc_error="не удалось записать метку назначения"
+        return 1
+    fi
+    exec 3>&-
+    if [ -L "$mx_live" ] || [ ! -f "$mx_live" ]; then
+        quc_error="метка назначения записана неверно"
+        return 1
+    fi
+    mx_now=$("$quc_bin_stat" -c '%i' -- "$mx_live" 2>/dev/null || true)
+    if [ -z "$mx_now" ] || [ "$mx_now" != "$mx_ino" ]; then
+        quc_error="метка назначения уже занята другим объектом"
+        return 1
+    fi
+    if ! quc_mount_mark_matches "$mx_live"; then
+        quc_probe_drop "$mx_live" "$mx_ino"
+        quc_error="метка назначения не подтвердилась"
+        return 1
+    fi
+    if ! quc_mount_mark_accept; then
+        return 1
+    fi
+    return 0
+}
+
+# Фиксирует уже сверенное конечное имя. Размер без cmp успехом не считается.
+quc_visible_commit() {
+    vc_src=$1
+    vc_dst=$2
+    vc_hex=$3
+    vc_size=$4
+    vc_fp=$5
+    vc_hash=${6:--}
+    if [ -L "$vc_dst" ] || [ ! -f "$vc_dst" ]; then
+        quc_error="конечный файл не подтверждён"
+        return 2
+    fi
+    vc_dev=$(quc_dev_of "$vc_dst" || true)
+    if [ "$vc_dev" != "$quc_target_dev" ]; then
+        quc_error="файл оказался не на файловой системе назначения и не удалён автоматически"
+        return 10
+    fi
+    if [ -z "${quc_bin_cmp:-}" ] || ! "$quc_bin_cmp" -s -- "$vc_src" "$vc_dst"; then
+        quc_error="содержимое копии не совпало и не объявлено готовым"
+        return 2
+    fi
+    vc_now=$(quc_file_size "$vc_dst" || true)
+    if [ "$vc_now" != "$vc_size" ]; then
+        quc_error="размер после переноса не совпал"
+        return 2
+    fi
+    quc_apply_metadata "$vc_src" "$vc_dst"
+    vc_fp_hex=$(quc_hex_encode "$vc_fp")
+    quc_append_meta F "$vc_hex" "$vc_size" "$vc_fp_hex" "$vc_hash" || return 2
+    quc_partial_clear
+    case $vc_size in
+        ''|*[!0-9]*|0*)
+            quc_bytes_done=$(quc_add_bytes "$quc_bytes_done" "$vc_size")
+            ;;
+        *)
+            quc_bytes_done=$((quc_bytes_done + vc_size))
+            ;;
+    esac
+    return 0
+}
+
+# Копирует обычный файл сразу в конечное имя, если жёсткой ссылки нет.
+# Имя видно до конца записи. До cmp оно не готово и в done.meta не попадает.
+# Чужой inode не удаляется. mv для данных пользователя не вызывается.
+quc_copy_visible() {
+    cv_src=$1
+    cv_dst=$2
+    cv_rel=$3
+    cv_hex=$4
+    cv_fp_given=${5:-}
+    cv_attempt=1
+    cv_unstable=0
+    if [ -z "${quc_bin_cmp:-}" ]; then
+        quc_error="сравнение содержимого недоступно, запись без жёсткой ссылки не начата"
+        return 2
+    fi
+    while quc_cmp_num "$cv_attempt" "$QUC_MAX_ATTEMPTS" le; do
+        if [ -f "$quc_job_dir/stop-requested" ] || [ "${quc_stop_requested:-0}" = 1 ]; then
+            quc_stop_requested=1
+            return 20
+        fi
+        if ! quc_identity_still; then
+            return 10
+        fi
+        if [ "$cv_attempt" = 1 ] && [ -n "$cv_fp_given" ]; then
+            cv_fp1=$cv_fp_given
+        else
+            cv_fp1=$(quc_fingerprint "$cv_src" || true)
+        fi
+        if [ -z "$cv_fp1" ]; then
+            quc_error="не удалось прочитать сведения о файле"
+            return 2
+        fi
+        cv_size=${cv_fp1%% *}
+        cv_lim=$(quc_fat_limit "$quc_target_fs")
+        if [ -n "$cv_lim" ] && quc_cmp_num "$cv_size" "$cv_lim" gt; then
+            quc_error="файл больше предела FAT32 ($(quc_human_bytes "$cv_size"))"
+            quc_log ERROR "path=$(quc_display_path "$cv_rel") $quc_error"
+            return 4
+        fi
+        if quc_fat_name_bad "$quc_target_fs" "$cv_rel"; then
+            quc_error="имя несовместимо с назначением"
+            quc_log ERROR "path=$(quc_display_path "$cv_rel") $quc_error"
+            return 4
+        fi
+        quc_set_parent "$cv_rel"
+        cv_parent=$quc_parent
+        case $cv_parent in
+            .|'') ;;
+            *)
+                quc_ensure_dir "$cv_parent"
+                cv_rc=$?
+                if [ "$cv_rc" -ne 0 ]; then
+                    return "$cv_rc"
+                fi
+                ;;
+        esac
+        quc_set_parent "$cv_dst"
+        if ! quc_dest_dir_still "$quc_parent"; then
+            return 10
+        fi
+        if [ -e "$cv_dst" ] || [ -L "$cv_dst" ]; then
+            if [ -L "$cv_dst" ] || [ ! -f "$cv_dst" ]; then
+                quc_error="в назначении уже есть другой объект, он не заменён"
+                return 11
+            fi
+            if "$quc_bin_cmp" -s -- "$cv_src" "$cv_dst"; then
+                cv_fp2=$(quc_fingerprint "$cv_src" || true)
+                if [ -n "$cv_fp2" ] && [ "$cv_fp2" = "$cv_fp1" ]; then
+                    quc_visible_commit "$cv_src" "$cv_dst" "$cv_hex" "$cv_size" "$cv_fp1" -
+                    return $?
+                fi
+            fi
+            cv_now=$("$quc_bin_stat" -c '%i' -- "$cv_dst" 2>/dev/null || true)
+            if [ "$quc_partial_visible" = 1 ] && [ "$quc_partial_rel_hex" = "$cv_hex" ] && [ -n "$quc_partial_ino" ] && [ "$cv_now" = "$quc_partial_ino" ]; then
+                quc_drop_owned "$cv_dst" "$quc_partial_ino"
+                if [ -e "$cv_dst" ] || [ -L "$cv_dst" ]; then
+                    quc_error="незавершённый файл не снят, замена не выполняется"
+                    return 11
+                fi
+                quc_partial_clear
+                quc_save_state || true
+            else
+                quc_error="в назначении уже есть другой объект, он не заменён"
+                return 11
+            fi
+        fi
+        quc_set_phase "copying:$cv_attempt" "$cv_rel"
+        quc_transfer_rel_hex=$cv_hex
+        quc_transfer_visible=1
+        quc_transfer_exclusive "$cv_src" "$cv_dst" yes
+        cv_rc=$?
+        quc_transfer_visible=0
+        if [ "$cv_rc" -ne 0 ]; then
+            if [ "$cv_rc" -eq 20 ] || [ "${quc_stop_requested:-0}" = 1 ]; then
+                return 20
+            fi
+            if [ "$cv_rc" -eq 11 ]; then
+                quc_error="в назначении уже есть другой объект, он не заменён"
+                return 11
+            fi
+            if [ -f "$(quc_scratch_file transfer.err)" ] && "$quc_bin_grep" -q -e 'No space left' -e 'Disk quota exceeded' "$(quc_scratch_file transfer.err)"; then
+                quc_partial_remember "$cv_dst" "$cv_hex" "$quc_fill_ino"
+                quc_error="на назначении закончилось место"
+                return 10
+            fi
+            if ! quc_identity_still; then
+                return 10
+            fi
+            if [ -n "$quc_fill_ino" ]; then
+                quc_partial_remember "$cv_dst" "$cv_hex" "$quc_fill_ino"
+                quc_error="не удалось записать файл, незавершённый результат оставлен"
+                return 2
+            fi
+            cv_attempt=$(quc_add_bytes "$cv_attempt" 1)
+            continue
+        fi
+        cv_delay=${QUC_POST_COPY_DELAY:-0}
+        case $cv_delay in
+            0) ;;
+            *) cv_delay=$(quc_pause_seconds QUC_POST_COPY_DELAY 0 30) ;;
+        esac
+        if [ "$cv_delay" != 0 ]; then
+            quc_set_phase "confirming:$cv_attempt" "$cv_rel"
+            if ! quc_sleep_interruptible "$cv_delay"; then
+                quc_partial_remember "$cv_dst" "$cv_hex" "$quc_fill_ino"
+                return 20
+            fi
+        fi
+        cv_fp2=$(quc_fingerprint "$cv_src" || true)
+        if [ -z "$cv_fp2" ] || [ "$cv_fp1" != "$cv_fp2" ]; then
+            quc_drop_owned "$cv_dst" "$quc_fill_ino"
+            if [ -e "$cv_dst" ] || [ -L "$cv_dst" ]; then
+                quc_error="файл изменился, а прежняя копия не снята"
+                return 11
+            fi
+            quc_partial_clear
+            cv_unstable=1
+            quc_log INFO "path=$(quc_display_path "$cv_rel") файл изменился во время копирования, повтор $cv_attempt"
+            cv_attempt=$(quc_add_bytes "$cv_attempt" 1)
+            continue
+        fi
+        if [ -L "$cv_dst" ] || [ ! -f "$cv_dst" ]; then
+            quc_error="в назначении уже есть другой объект, он не заменён"
+            return 11
+        fi
+        cv_now=$("$quc_bin_stat" -c '%i' -- "$cv_dst" 2>/dev/null || true)
+        if [ -z "$quc_fill_ino" ] || [ "$cv_now" != "$quc_fill_ino" ]; then
+            quc_error="в назначении уже есть другой объект, он не заменён"
+            return 11
+        fi
+        if ! "$quc_bin_cmp" -s -- "$cv_src" "$cv_dst"; then
+            quc_partial_remember "$cv_dst" "$cv_hex" "$quc_fill_ino"
+            quc_error="содержимое копии не совпало и не объявлено готовым"
+            return 2
+        fi
+        cv_hash='-'
+        if [ "$quc_verify_during" = 1 ]; then
+            if ! quc_hash_tool; then
+                quc_verify_tool=unavailable
+            else
+                quc_verify_tool=$quc_hash_name
+                cv_h1=$(quc_hash_file "$cv_src" || true)
+                cv_h2=$(quc_hash_file "$cv_dst" || true)
+                cv_h3=$(quc_hash_file "$cv_src" || true)
+                if [ -z "$cv_h1" ] || [ -z "$cv_h2" ] || [ -z "$cv_h3" ] || [ "$cv_h1" != "$cv_h3" ]; then
+                    quc_drop_owned "$cv_dst" "$quc_fill_ino"
+                    if [ -e "$cv_dst" ] || [ -L "$cv_dst" ]; then
+                        quc_partial_remember "$cv_dst" "$cv_hex" "$quc_fill_ino"
+                        quc_error="содержимое изменилось во время проверки"
+                        return 2
+                    fi
+                    quc_partial_clear
+                    cv_unstable=1
+                    cv_attempt=$(quc_add_bytes "$cv_attempt" 1)
+                    continue
+                fi
+                if [ "$cv_h1" != "$cv_h2" ]; then
+                    quc_partial_remember "$cv_dst" "$cv_hex" "$quc_fill_ino"
+                    quc_error="контрольная сумма копии не совпала"
+                    return 2
+                fi
+                cv_hash=$cv_h1
+            fi
+        fi
+        if quc_source_detached; then
+            cv_expect=$(quc_stage_hash_for "$cv_rel" || true)
+            cv_got=$(quc_hash_file "$cv_dst" || true)
+            if [ -z "$cv_expect" ] || [ -z "$cv_got" ] || [ "$cv_expect" != "$cv_got" ]; then
+                quc_partial_remember "$cv_dst" "$cv_hex" "$quc_fill_ino"
+                quc_error="локальная копия файла не совпала с описанием"
+                return 2
+            fi
+        fi
+        cv_pre=${QUC_PRE_PUBLISH_PAUSE:-0}
+        case $cv_pre in
+            0) ;;
+            *) cv_pre=$(quc_pause_seconds QUC_PRE_PUBLISH_PAUSE 0 60) ;;
+        esac
+        if [ "$cv_pre" != 0 ]; then
+            quc_set_phase "prepublish" "$cv_rel"
+            if ! quc_sleep_interruptible "$cv_pre"; then
+                quc_partial_remember "$cv_dst" "$cv_hex" "$quc_fill_ino"
+                return 20
+            fi
+        fi
+        if ! quc_identity_still; then
+            quc_partial_remember "$cv_dst" "$cv_hex" "$quc_fill_ino"
+            return 10
+        fi
+        cv_fp3=$(quc_fingerprint "$cv_src" || true)
+        cv_now=$("$quc_bin_stat" -c '%i' -- "$cv_dst" 2>/dev/null || true)
+        if [ -L "$cv_dst" ] || [ ! -f "$cv_dst" ] || [ "$cv_now" != "$quc_fill_ino" ]; then
+            quc_error="в назначении уже есть другой объект, он не заменён"
+            return 11
+        fi
+        if [ -z "$cv_fp3" ] || [ "$cv_fp3" != "$cv_fp1" ] || ! "$quc_bin_cmp" -s -- "$cv_src" "$cv_dst"; then
+            quc_partial_remember "$cv_dst" "$cv_hex" "$quc_fill_ino"
+            quc_error="содержимое копии не совпало и не объявлено готовым"
+            return 2
+        fi
+        quc_visible_commit "$cv_src" "$cv_dst" "$cv_hex" "$cv_size" "$cv_fp1" "$cv_hash"
+        cv_pub=$?
+        if [ "$cv_pub" -ne 0 ]; then
+            quc_partial_remember "$cv_dst" "$cv_hex" "$quc_fill_ino"
+            return "$cv_pub"
+        fi
+        return 0
+    done
+    if [ "$cv_unstable" = 1 ]; then
+        quc_error="файл менялся во время копирования, согласованная копия не получена"
+        quc_log ERROR "path=$(quc_display_path "$cv_rel") $quc_error"
+        return 3
+    fi
+    quc_error="не удалось скопировать файл"
+    quc_log ERROR "path=$(quc_display_path "$cv_rel") $quc_error"
+    return 2
+}
+
+# Создаёт символьную ссылку сразу под конечным именем. Чужое имя не заменяется.
+quc_copy_link_visible() {
+    if ! quc_identity_still; then
+        return 10
+    fi
+    clv_src=$1
+    clv_dst=$2
+    clv_rel=$3
+    clv_hex=$4
+    clv_target=$("$quc_bin_readlink" -- "$clv_src" 2>/dev/null || true)
+    if [ -z "$clv_target" ] && [ ! -L "$clv_src" ]; then
+        return 2
+    fi
+    quc_set_parent "$clv_rel"
+    clv_parent=$quc_parent
+    case $clv_parent in
+        .|'') ;;
+        *)
+            quc_ensure_dir "$clv_parent"
+            clv_rc=$?
+            if [ "$clv_rc" -ne 0 ]; then
+                return "$clv_rc"
+            fi
+            ;;
+    esac
+    quc_set_parent "$clv_dst"
+    if ! quc_dest_dir_still "$quc_parent"; then
+        return 10
+    fi
+    if [ -e "$clv_dst" ] || [ -L "$clv_dst" ]; then
+        if [ -L "$clv_dst" ]; then
+            clv_got=$("$quc_bin_readlink" -- "$clv_dst" 2>/dev/null || true)
+            if [ -n "$clv_target" ] && [ "$clv_got" = "$clv_target" ]; then
+                clv_th=$(quc_hex_encode "$clv_target")
+                quc_append_meta L "$clv_hex" 0 "$clv_th" - || return 2
+                quc_partial_clear
+                return 0
+            fi
+        fi
+        quc_error="в назначении уже есть другой объект, он не заменён"
+        return 11
+    fi
+    if ! "$quc_bin_ln" -s -- "$clv_target" "$clv_dst" 2>"$(quc_scratch_file transfer.err)"; then
+        if [ -e "$clv_dst" ] || [ -L "$clv_dst" ]; then
+            quc_error="в назначении уже есть другой объект, он не заменён"
+            return 11
+        fi
+        quc_error="файловая система назначения не поддерживает символьные ссылки"
+        quc_log ERROR "path=$(quc_display_path "$clv_rel") $quc_error"
+        return 4
+    fi
+    clv_ino=$("$quc_bin_stat" -c '%i' -- "$clv_dst" 2>/dev/null || true)
+    if [ -z "$clv_ino" ] || [ ! -L "$clv_dst" ]; then
+        quc_error="символьная ссылка записана неверно"
+        return 2
+    fi
+    quc_partial_rel_hex=$clv_hex
+    quc_partial_ino=$clv_ino
+    quc_partial_bytes=0
+    quc_partial_visible=1
+    quc_note_owned "$clv_ino"
+    quc_save_state || true
+    clv_got=$("$quc_bin_readlink" -- "$clv_dst" 2>/dev/null || true)
+    if [ "$clv_got" != "$clv_target" ]; then
+        quc_error="символьная ссылка записана неверно"
+        return 2
+    fi
+    clv_th=$(quc_hex_encode "$clv_target")
+    quc_append_meta L "$clv_hex" 0 "$clv_th" - || return 2
+    quc_partial_clear
+    return 0
+}
+
+# Новое имя при доступной жёсткой ссылке публикуется только через ln без -L.
+# Это link(2): занятое имя даёт отказ и не заменяется. mv для данных
+# пользователя не вызывается. Нулевой код mv не считается публикацией.
+# Если ссылки нет, конечное имя создаётся отдельно и не называется атомарным.
 # --- Безопасное копирование ---
 
 # Публикует уже записанный временный файл под новым именем.
-# Принимает временный путь и конечный путь. Меняет каталог назначения.
-# Успех: 0, только если исходное имя исчезло и inode назначения совпал.
-# Отказ: 11. Существующее чужое имя не заменяется.
+# Принимает временный путь, конечный путь и inode временного файла.
+# Успех: 0, только если временное имя исчезло и inode назначения совпал.
+# Отказ: 11, чужое имя уже есть. Отказ: 2, ссылку создать нельзя.
+# Чужое имя не снимается, даже если inode после ссылки не совпал.
 quc_install_new() {
     in_tmp=$1
     in_dst=$2
@@ -2018,14 +2899,24 @@ quc_install_new() {
         fi
     fi
     if "$quc_bin_ln" -- "$in_tmp" "$in_dst" 2>/dev/null; then
+        in_dst_ino=$("$quc_bin_stat" -c '%i' -- "$in_dst" 2>/dev/null || true)
         if [ -n "$in_ino" ]; then
-            in_dst_ino=$("$quc_bin_stat" -c '%i' -- "$in_dst" 2>/dev/null || true)
             if [ -z "$in_dst_ino" ] || [ "$in_dst_ino" != "$in_ino" ]; then
                 # Имя уже не наш inode. Снимать его нельзя: это может быть чужой объект.
                 return 2
             fi
             quc_drop_owned "$in_tmp" "$in_ino"
+            if [ -e "$in_tmp" ] || [ -L "$in_tmp" ]; then
+                return 2
+            fi
             return 0
+        fi
+        in_tmp_ino=$("$quc_bin_stat" -c '%i' -- "$in_tmp" 2>/dev/null || true)
+        if [ -n "$in_dst_ino" ] && [ "$in_dst_ino" = "$in_tmp_ino" ]; then
+            quc_drop_owned "$in_tmp" "$in_tmp_ino"
+        fi
+        if [ -e "$in_tmp" ] || [ -L "$in_tmp" ]; then
+            return 2
         fi
         if [ -e "$in_dst" ] || [ -L "$in_dst" ]; then
             return 0
@@ -2041,30 +2932,9 @@ quc_install_new() {
             return 2
         fi
     fi
-    if "$quc_bin_mv" -n -- "$in_tmp" "$in_dst" 2>/dev/null; then
-        if [ ! -e "$in_tmp" ] && [ ! -L "$in_tmp" ]; then
-            if [ -n "$in_ino" ]; then
-                in_dst_ino=$("$quc_bin_stat" -c '%i' -- "$in_dst" 2>/dev/null || true)
-                if [ -n "$in_dst_ino" ] && [ "$in_dst_ino" = "$in_ino" ]; then
-                    return 0
-                fi
-                return 2
-            fi
-            if [ -e "$in_dst" ] || [ -L "$in_dst" ]; then
-                return 0
-            fi
-            return 2
-        fi
-        if [ -e "$in_dst" ] || [ -L "$in_dst" ]; then
-            return 11
-        fi
-    fi
-    if [ -e "$in_dst" ] || [ -L "$in_dst" ]; then
-        return 11
-    fi
     if [ "${quc_publish_limited:-0}" != 1 ]; then
         quc_publish_limited=1
-        quc_log INFO "безопасная публикация недоступна: имя не перенесено, принудительная замена не используется"
+        quc_log INFO "безопасная публикация недоступна: жёсткая ссылка не создана, замена имени не используется"
     fi
     return 2
 }
@@ -2117,6 +2987,10 @@ quc_mount_mark_place() {
         fi
         quc_error="метка назначения уже занята другим объектом"
         return 1
+    fi
+    if [ "${quc_publish_mode:-}" = exclusive ]; then
+        quc_mark_place_exclusive "$mm_live"
+        return $?
     fi
     mm_tmp=$quc_write_root/${QUC_PARTIAL_PREFIX}$$.mnt
     if ! quc_write_exclusive "$mm_tmp" "$quc_mount_secret"; then
@@ -2498,6 +3372,7 @@ quc_pause_seconds() {
         QUC_FILE_PAUSE) raw=${QUC_FILE_PAUSE:-$def} ;;
         QUC_PRE_PUBLISH_PAUSE) raw=${QUC_PRE_PUBLISH_PAUSE:-$def} ;;
         QUC_PRE_MARK_PAUSE) raw=${QUC_PRE_MARK_PAUSE:-$def} ;;
+        QUC_PRE_VERIFY_PAUSE) raw=${QUC_PRE_VERIFY_PAUSE:-$def} ;;
         QUC_FILL_PAUSE) raw=${QUC_FILL_PAUSE:-$def} ;;
     esac
     n=$(quc_norm_uint "$raw")
@@ -2645,6 +3520,8 @@ quc_transfer_exclusive() {
     te_src=$1
     te_dst=$2
     te_sync=${3:-yes}
+    te_visible=${quc_transfer_visible:-0}
+    quc_transfer_visible=0
     quc_fill_ino=
     te_err=$(quc_scratch_file transfer.err)
     : > "$te_err"
@@ -2664,6 +3541,14 @@ quc_transfer_exclusive() {
             return 11
             ;;
     esac
+    if [ "$te_visible" = 1 ]; then
+        quc_partial_rel_hex=${quc_transfer_rel_hex:-}
+        quc_partial_ino=$te_ino
+        quc_partial_bytes=0
+        quc_partial_visible=1
+        quc_note_owned "$te_ino"
+        quc_save_state || true
+    fi
     te_pause=${QUC_FILL_PAUSE:-0}
     case $te_pause in
         0) ;;
@@ -2952,7 +3837,12 @@ quc_dest_dir_still() {
 # Меняет счётчики, quc_error и журнал. Повторяет попытку до QUC_MAX_ATTEMPTS.
 # Успех: 0. Отказ: 2 чтение, 4 размер, 10 носитель, 11 публикация, 20 сигнал.
 # Не заменяет существующее имя и не публикует в другой каталог.
+# Режим exclusive пишет сразу в конечное имя. Пустой режим остаётся на ln.
 quc_copy_regular() {
+    if [ "${quc_publish_mode:-}" = exclusive ]; then
+        quc_copy_visible "$@"
+        return $?
+    fi
     cr_src=$1
     cr_dst=$2
     cr_rel=$3
@@ -2984,6 +3874,11 @@ quc_copy_regular() {
             quc_log ERROR "path=$(quc_display_path "$cr_rel") $quc_error"
             return 4
         fi
+        if quc_fat_name_bad "$quc_target_fs" "$cr_rel"; then
+            quc_error="имя несовместимо с назначением"
+            quc_log ERROR "path=$(quc_display_path "$cr_rel") $quc_error"
+            return 4
+        fi
         quc_set_parent "$cr_rel"
         cr_parent=$quc_parent
         case $cr_parent in
@@ -2996,11 +3891,6 @@ quc_copy_regular() {
                 fi
                 ;;
         esac
-        if quc_fat_name_bad "$quc_target_fs" "$cr_rel"; then
-            quc_error="имя несовместимо с FAT"
-            quc_log ERROR "path=$(quc_display_path "$cr_rel") $quc_error"
-            return 4
-        fi
         quc_set_parent "$cr_dst"
         cr_tmp_dir=$quc_parent
         if ! quc_dest_dir_still "$cr_tmp_dir"; then
@@ -3184,6 +4074,10 @@ quc_copy_regular() {
 }
 
 quc_copy_link() {
+    if [ "${quc_publish_mode:-}" = exclusive ]; then
+        quc_copy_link_visible "$@"
+        return $?
+    fi
     if ! quc_identity_still; then
         return 10
     fi
@@ -3998,9 +4892,220 @@ quc_eject_run() {
     return 0
 }
 
+# Сверяет уже опубликованные имена с источником. Не публикует и не удаляет.
+# Ставит verify_status=checksum или byte только после чтения конечных файлов.
+# size и none сюда не записываются. Смена источника даёт uncertain.
+# Успех: 0, если проверка дошла до итога. Сигнал: 20.
+quc_verify_published() {
+    quc_verify_bad=0
+    quc_verify_uncertain=0
+    quc_verify_rows=0
+    vp_tool_dead=0
+    vp_root=${quc_read_root:-$quc_source}
+    vp_write=${quc_write_root:-$quc_target}
+    vp_real=$("$quc_bin_readlink" -f -- "$vp_write" 2>/dev/null || true)
+    vp_src_real=$("$quc_bin_readlink" -f -- "$vp_root" 2>/dev/null || true)
+    if [ -z "$vp_real" ] || [ -L "$vp_write" ] || [ ! -d "$vp_write" ]; then
+        quc_verify_status=failed
+        quc_verify_tool=${quc_verify_tool:-}
+        quc_error="каталог назначения не подтверждён перед проверкой содержимого"
+        return 0
+    fi
+    if [ -z "$vp_src_real" ] || [ -L "$vp_root" ] || [ ! -d "$vp_root" ]; then
+        quc_verify_status=uncertain
+        quc_tree_changed=1
+        quc_error="источник изменился во время проверки содержимого"
+        return 0
+    fi
+    if ! quc_hash_tool; then
+        if [ -z "${quc_bin_cmp:-}" ]; then
+            quc_verify_tool=unavailable
+            quc_verify_status=none
+            quc_log INFO "проверка содержимого недоступна: нет суммы и нет cmp"
+            return 0
+        fi
+        quc_verify_tool='cmp'
+        vp_method=byte
+    else
+        quc_verify_tool=$quc_hash_name
+        vp_method=checksum
+    fi
+    if [ ! -f "${quc_meta_file:-}" ]; then
+        quc_verify_status=failed
+        quc_error="список опубликованных файлов отсутствует"
+        quc_log INFO "content-verify status=failed tool=$quc_verify_tool"
+        return 0
+    fi
+    vp_tab=$(printf '\t')
+    while IFS= read -r vp_line || [ -n "$vp_line" ]; do
+        [ -n "$vp_line" ] || continue
+        if [ -f "$quc_job_dir/stop-requested" ] || [ "${quc_stop_requested:-0}" = 1 ]; then
+            quc_stop_requested=1
+            return 20
+        fi
+        vp_kind=${vp_line%%"${vp_tab}"*}
+        vp_rest=${vp_line#*"${vp_tab}"}
+        vp_hex=${vp_rest%%"${vp_tab}"*}
+        vp_rest=${vp_rest#*"${vp_tab}"}
+        vp_size=${vp_rest%%"${vp_tab}"*}
+        vp_rest=${vp_rest#*"${vp_tab}"}
+        vp_fphex=${vp_rest%%"${vp_tab}"*}
+        case $vp_kind in
+            F|L|D) ;;
+            *) continue ;;
+        esac
+        if [ -z "$vp_hex" ] || ! quc_decode_hex_var "$vp_hex"; then
+            quc_verify_bad=1
+            continue
+        fi
+        vp_src=$quc_decoded
+        case $vp_src in
+            "$vp_root") continue ;;
+            "$vp_root"/*) ;;
+            *)
+                quc_verify_bad=1
+                continue
+                ;;
+        esac
+        vp_rel=${vp_src#"$vp_root/"}
+        case $vp_rel in
+            ''|..|../*|*/..|*/../*)
+                quc_verify_bad=1
+                continue
+                ;;
+        esac
+        quc_verify_rows=$((quc_verify_rows + 1))
+        vp_dst=$vp_write/$vp_rel
+        if [ "$vp_kind" != L ] && [ -L "$vp_src" ]; then
+            quc_verify_uncertain=1
+            quc_log INFO "path=$(quc_display_path "$vp_rel") источник сменил вид во время проверки"
+            continue
+        fi
+        if [ "$vp_kind" != L ] && [ -L "$vp_dst" ]; then
+            quc_verify_bad=1
+            quc_log ERROR "path=$(quc_display_path "$vp_rel") опубликованное имя стало ссылкой"
+            continue
+        fi
+        if [ "$vp_kind" = L ]; then
+            quc_set_parent "$vp_dst"
+            vp_parent=$quc_parent
+            vp_dst_real=$("$quc_bin_readlink" -f -- "$vp_parent" 2>/dev/null || true)
+        else
+            vp_dst_real=$("$quc_bin_readlink" -f -- "$vp_dst" 2>/dev/null || true)
+        fi
+        case $vp_dst_real in
+            "$vp_real"|"$vp_real"/*) ;;
+            *)
+                quc_verify_bad=1
+                quc_log ERROR "path=$(quc_display_path "$vp_rel") объект вне каталога назначения"
+                continue
+                ;;
+        esac
+        case $vp_kind in
+            D)
+                if [ ! -d "$vp_dst" ]; then
+                    quc_verify_bad=1
+                fi
+                ;;
+            L)
+                if [ ! -L "$vp_src" ]; then
+                    quc_verify_uncertain=1
+                elif [ ! -L "$vp_dst" ]; then
+                    quc_verify_bad=1
+                else
+                    vp_a=$("$quc_bin_readlink" -- "$vp_src" 2>/dev/null || true)
+                    vp_b=$("$quc_bin_readlink" -- "$vp_dst" 2>/dev/null || true)
+                    if [ -z "$vp_a" ] || [ "$vp_a" != "$vp_b" ]; then
+                        quc_verify_bad=1
+                    fi
+                fi
+                ;;
+            F)
+                if [ ! -f "$vp_src" ]; then
+                    quc_verify_uncertain=1
+                    continue
+                fi
+                if [ ! -f "$vp_dst" ]; then
+                    quc_verify_bad=1
+                    continue
+                fi
+                vp_fp1=$(quc_fingerprint "$vp_src" || true)
+                vp_fphex_now=$(quc_hex_encode "$vp_fp1")
+                if [ -z "$vp_fp1" ] || [ -z "$vp_fphex" ] || [ "$vp_fphex_now" != "$vp_fphex" ]; then
+                    quc_verify_uncertain=1
+                    continue
+                fi
+                vp_dsize=$(quc_file_size "$vp_dst" || true)
+                if [ "$vp_dsize" != "$vp_size" ]; then
+                    quc_verify_bad=1
+                    continue
+                fi
+                vp_same=0
+                if [ "$vp_method" = byte ]; then
+                    if "$quc_bin_cmp" -s -- "$vp_src" "$vp_dst"; then
+                        vp_same=1
+                    fi
+                else
+                    vp_h1=$(quc_hash_file "$vp_src" || true)
+                    vp_h2=$(quc_hash_file "$vp_dst" || true)
+                    vp_h3=$(quc_hash_file "$vp_src" || true)
+                    if [ -n "$vp_h1" ] && [ "$vp_h1" = "$vp_h2" ] && [ "$vp_h1" = "$vp_h3" ]; then
+                        vp_same=1
+                    fi
+                fi
+                vp_fp2=$(quc_fingerprint "$vp_src" || true)
+                if [ "$vp_fp1" != "$vp_fp2" ]; then
+                    quc_verify_uncertain=1
+                    continue
+                fi
+                if [ "$vp_method" != byte ]; then
+                    if [ -z "$vp_h1" ] || [ -z "$vp_h2" ] || [ -z "$vp_h3" ]; then
+                        quc_verify_tool=unavailable
+                        vp_tool_dead=1
+                        continue
+                    fi
+                    if [ "$vp_h1" != "$vp_h3" ]; then
+                        quc_verify_uncertain=1
+                        continue
+                    fi
+                fi
+                if [ "$vp_same" != 1 ]; then
+                    quc_verify_bad=1
+                fi
+                ;;
+        esac
+    done < "$quc_meta_file"
+    if [ "$quc_verify_rows" = 0 ] && quc_cmp_num "${quc_files_done:-0}" 0 gt; then
+        quc_verify_bad=1
+    fi
+    if [ "$quc_verify_uncertain" = 1 ]; then
+        quc_verify_status=uncertain
+        quc_tree_changed=1
+        quc_error="источник изменился во время проверки содержимого"
+        quc_log INFO "content-verify status=uncertain tool=$quc_verify_tool"
+        return 0
+    fi
+    if [ "$vp_tool_dead" = 1 ]; then
+        quc_verify_status=none
+        quc_verify_tool=unavailable
+        quc_log INFO "проверка содержимого недоступна: средство проверки не сработало"
+        return 0
+    fi
+    if [ "$quc_verify_bad" = 1 ]; then
+        quc_verify_status=failed
+        quc_error="содержимое опубликованного файла не совпало"
+        quc_log INFO "content-verify status=failed tool=$quc_verify_tool"
+        return 0
+    fi
+    quc_verify_status=$vp_method
+    quc_log INFO "content-verify status=$quc_verify_status tool=$quc_verify_tool rows=$quc_verify_rows"
+    return 0
+}
+
 # Решает автоотключение назначения после COPY, VERIFY и SYNC.
-# Аргументов нет. Меняет quc_eject_status и файл состояния вызовом снаружи.
+# Аргументов нет. Меняет quc_eject_status. Файл состояния пишет вызывающий.
 # Успех: 0 всегда. Отказ отключения не меняет copy_status и quc_error.
+# size и none отключение не разрешают. SUCCESS не означает долговременную запись.
 # Не отключает источник, не запрашивает пароль и не обходит отказ системы.
 quc_auto_disconnect() {
     ej_err_saved=${quc_error:-}
@@ -4021,7 +5126,7 @@ quc_auto_disconnect() {
         return 0
     fi
     case ${quc_verify_status:-none} in
-        checksum|byte|size) ;;
+        checksum|byte) ;;
         *)
             quc_eject_status=skipped_policy
             quc_error=$ej_err_saved
@@ -4070,17 +5175,23 @@ quc_finalize() {
     if [ -n "$msg" ]; then
         quc_error=$msg
     fi
-    if [ "$quc_verify_during" = 1 ] && [ -n "${quc_verify_tool:-}" ] && [ "$quc_verify_tool" != unavailable ]; then
-        if quc_cmp_num "$quc_files_uncertain" 0 gt || [ "$quc_tree_changed" = 1 ]; then
-            quc_verify_status=uncertain
-        elif quc_cmp_num "$quc_files_failed" 0 gt || quc_cmp_num "$quc_files_skipped" 0 gt; then
-            quc_verify_status=failed
-        elif [ -z "$quc_fatal_kind" ]; then
-            quc_verify_status=checksum
-        fi
-    elif [ "${quc_verify_status:-none}" = none ]; then
-        quc_verify_status=size
-    fi
+    case ${quc_verify_status:-none} in
+        checksum|byte)
+            if quc_cmp_num "$quc_files_uncertain" 0 gt || [ "$quc_tree_changed" = 1 ]; then
+                quc_verify_status=uncertain
+            elif quc_cmp_num "$quc_files_failed" 0 gt || quc_cmp_num "$quc_files_skipped" 0 gt; then
+                quc_verify_status=failed
+            fi
+            ;;
+        failed|uncertain) ;;
+        none)
+            if [ "${quc_verify_tool:-}" = unavailable ]; then
+                quc_verify_status=none
+            else
+                quc_verify_status=size
+            fi
+            ;;
+    esac
     quc_copy_status=$(quc_decide_copy_status "$quc_fatal_kind" "$quc_files_done" "$quc_files_failed" "$quc_files_uncertain" "$quc_files_skipped" "$quc_tree_changed")
     if [ "$quc_copy_status" = SUCCESS ]; then
         if ! quc_mount_mark_release; then
@@ -4985,12 +6096,20 @@ quc_stage_offer_check() {
         return 1
     fi
     so_root=$(quc_stage_root) || return 1
-    so_parent=$("$quc_bin_dirname" -- "$so_root")
-    if [ ! -d "$so_parent" ]; then
-        quc_add_note "локальная копия недоступна: нет каталога данных"
-        return 1
-    fi
-    so_free=$(quc_free_bytes "$so_parent" || true)
+    # Каталог программы может ещё не существовать. Место смотрим у ближайшего
+    # существующего предка. Создаёт его только явный выбор локальной копии.
+    so_probe=$so_root
+    so_guard=0
+    while [ ! -d "$so_probe" ] || [ -L "$so_probe" ]; do
+        so_guard=$((so_guard + 1))
+        so_next=$("$quc_bin_dirname" -- "$so_probe")
+        if [ "$so_guard" -gt 64 ] || [ -z "$so_next" ] || [ "$so_next" = "$so_probe" ]; then
+            quc_add_note "локальная копия недоступна: нет каталога данных"
+            return 1
+        fi
+        so_probe=$so_next
+    done
+    so_free=$(quc_free_bytes "$so_probe" || true)
     if [ -z "$so_free" ]; then
         quc_add_note "локальная копия недоступна: не видно свободное место"
         return 1
@@ -5152,6 +6271,21 @@ quc_worker_main() {
         quc_finalize FAILED "${quc_error:-носитель недоступен}"
         exit 1
     fi
+    if ! quc_select_publish_mode "$quc_write_root"; then
+        quc_finalize FAILED "${quc_error:-На этом назначении нельзя создать новое имя без риска замены. Копирование не начато.}"
+        exit 1
+    fi
+    case ${quc_publish_mode:-} in
+        link|exclusive) ;;
+        *)
+            quc_finalize FAILED "безопасная публикация нового имени недоступна"
+            exit 1
+            ;;
+    esac
+    if [ "$quc_publish_mode" = exclusive ]; then
+        quc_log INFO "публикация без жёсткой ссылки: новое имя видно до проверки и не считается готовым"
+    fi
+    quc_save_state || exit 1
     if ! quc_mount_mark_place; then
         quc_finalize FAILED "${quc_error:-не удалось отметить назначение}"
         exit 1
@@ -5197,6 +6331,28 @@ quc_worker_main() {
     if ! quc_identity_still; then
         quc_finalize FAILED "${quc_error:-носитель недоступен перед завершением}"
         exit 1
+    fi
+    # COPY завершён. Конечные имена сверяются до sync и до снятия метки.
+    if [ "${quc_eject_policy:-no}" = yes ] || [ "${quc_verify_during:-0}" = 1 ]; then
+        quc_set_phase "content-verify" ""
+        cv_pause=${QUC_PRE_VERIFY_PAUSE:-0}
+        case $cv_pause in
+            0) ;;
+            *) cv_pause=$(quc_pause_seconds QUC_PRE_VERIFY_PAUSE 0 60) ;;
+        esac
+        if [ "$cv_pause" != 0 ]; then
+            if ! quc_sleep_interruptible "$cv_pause"; then
+                quc_finalize_rc 20 "прервано до проверки содержимого"
+                exit 1
+            fi
+        fi
+        quc_verify_published
+        cv_rc=$?
+        quc_save_state || true
+        if [ "$cv_rc" -ne 0 ]; then
+            quc_finalize_rc "$cv_rc" "${quc_error:-проверка содержимого прервана}"
+            exit 1
+        fi
     fi
     if [ "$quc_sync_mode" != data ] && [ "$quc_sync_mode" != file ]; then
         quc_sync_unconfirmed=1
@@ -5350,12 +6506,17 @@ staged сначала делает локальную файловую копи�
 файлов не является атомарным снимком всего дерева. MERGE_SAFE не
 реализован: отличающийся файл не заменяется.
 
-plan показывает намерение и место и ничего не копирует. Поля plan:
-plan_level READY, LIMITED или REJECT; publish_policy=no-replace;
-dest_link_probe=UNKNOWN; checks_not_run=dest_hardlink; content_tool.
-READY не означает, что жёсткие ссылки на назначении проверены.
-UNKNOWN в эти поля не подставляется как READY. Существующее имя не
-заменяется. Принудительное перемещение не используется. check по-прежнему
+plan показывает намерение и место. На выбранном назначении создаётся
+и сразу удаляется короткое новое имя, чтобы узнать способ публикации.
+Поля plan: plan_level READY, LIMITED или REJECT; publish_policy=no-replace;
+dest_link_probe link, exclusive, unsupported или UNKNOWN; content_tool.
+Если проба выполнена, checks_not_run=dest_hardlink не печатается.
+UNKNOWN остаётся, когда назначение не выбрано. Существующее имя не
+заменяется. Если жёсткая ссылка доступна, новое имя создаётся ею.
+Если ссылки нет и повторное создание того же имени не затирает файл,
+имя создаётся сразу и видно до проверки содержимого. Это не атомарная
+публикация и не считается готовым файлом, пока содержимое не совпадёт.
+Принудительное перемещение не используется. check по-прежнему
 требует пустое назначение. resume продолжает прерванное задание, в том
 числе если процесс исчез, а блокировка осталась. Изменённый файл при
 resume не заменяется. Успешные копирование, контрольная сумма и sync не
@@ -5394,7 +6555,10 @@ cleanup удаляет только свои служебные данные и 
 
 Поля state: copy_status, verify_status, sync_status, stage_status,
 source_mode, dest_mode, recovery_status, job_phase, source_dependency,
-eject_policy, eject_status.
+eject_policy, eject_status, publish_mode, dest_link_probe,
+partial_rel_hex, partial_ino, partial_bytes, partial_visible.
+publish_mode link или exclusive. partial_visible=1 значит имя уже видно,
+а содержимое ещё не признано проверенным.
 stage_status: none, preparing, verifying, READY, failed, damaged.
 source_mode: direct, staged. dest_mode: root, separate.
 EOF
@@ -5519,6 +6683,19 @@ quc_cmd_plan() {
         printf 'Нужно места: %s\n' "$(quc_human_bytes "$quc_need_bytes")"
         printf 'Свободно в назначении: %s\n' "$(quc_human_bytes "${quc_free_have:-0}")"
     fi
+    if ! quc_select_publish_mode "$quc_target"; then
+        printf 'Причина: %s\n' "${quc_error:-На этом назначении нельзя создать новое имя без риска замены. Копирование не начато.}"
+        printf '%s\n' "Копирование не запускается."
+        printf '%s\n' "plan_level=REJECT"
+        printf '%s\n' "publish_policy=no-replace"
+        printf 'dest_link_probe=%s\n' "${quc_dest_link_probe:-unsupported}"
+        printf '%s\n' "plan_result=REJECT"
+        printf '%s\n' "error_code=E_REJECT"
+        return 1
+    fi
+    if [ "${quc_publish_mode:-}" = exclusive ]; then
+        quc_add_note "Жёсткие ссылки на назначении недоступны. Новый файл виден до проверки содержимого и не считается готовым."
+    fi
     if [ -n "$quc_notes" ]; then
         printf '%s\n' "$quc_notes" | while IFS= read -r line; do
             [ -n "$line" ] || continue
@@ -5526,7 +6703,14 @@ quc_cmd_plan() {
         done
     fi
     printf '%s\n' "Существующие имена не заменяются. Принудительное перемещение не используется."
-    printf '%s\n' "Не проверено: жёсткие ссылки на назначении. Имя файловой системы это не подтверждает."
+    case ${quc_publish_mode:-} in
+        link)
+            printf '%s\n' "Жёсткие ссылки на назначении доступны. Новое имя создаётся ссылкой."
+            ;;
+        exclusive)
+            printf '%s\n' "Жёсткие ссылки на назначении недоступны. Новый файл виден до проверки содержимого и не считается готовым."
+            ;;
+    esac
     printf '%s\n' "При отказе публикации уже записанные файлы остаются. Дальше: status или report."
     pl_level=READY
     if [ -n "$quc_notes" ]; then
@@ -5540,9 +6724,8 @@ quc_cmd_plan() {
     fi
     printf 'plan_level=%s\n' "$pl_level"
     printf '%s\n' "publish_policy=no-replace"
-    printf '%s\n' "dest_link_probe=UNKNOWN"
+    printf 'dest_link_probe=%s\n' "${quc_dest_link_probe:-UNKNOWN}"
     printf 'content_tool=%s\n' "$pl_tool"
-    printf '%s\n' "checks_not_run=dest_hardlink"
     printf '%s\n' "MERGE_SAFE=NOT_IMPLEMENTED"
     printf '%s\n' "plan_result=OK"
     printf '%s\n' "error_code=E_OK"
@@ -5925,6 +7108,41 @@ quc_print_eject_human() {
             printf '%s\n' "Результат отключения неизвестен. Не извлекайте накопитель вслепую."
             ;;
     esac
+    case ${quc_eject_status:-skipped_policy} in
+        power_off|unmounted|unavailable|refused|unknown) return 0 ;;
+    esac
+    if [ "${quc_eject_policy:-no}" != yes ]; then
+        printf '%s\n' "Назначение оставлено подключённым: автоотключение выключено."
+        return 0
+    fi
+    case ${quc_verify_status:-none} in
+        checksum|byte) ;;
+        failed)
+            printf '%s\n' "Назначение оставлено подключённым: содержимое назначения не совпало."
+            return 0
+            ;;
+        uncertain)
+            printf '%s\n' "Назначение оставлено подключённым: источник изменился во время проверки."
+            return 0
+            ;;
+        size)
+            printf '%s\n' "Назначение оставлено подключённым: содержимое не проверено."
+            return 0
+            ;;
+        *)
+            printf '%s\n' "Назначение оставлено подключённым: проверка содержимого недоступна."
+            return 0
+            ;;
+    esac
+    if [ "${quc_copy_status:-}" != SUCCESS ]; then
+        printf '%s\n' "Назначение оставлено подключённым: копирование не завершено успешно."
+        return 0
+    fi
+    if [ "${quc_sync_status:-unconfirmed}" != command_ok ]; then
+        printf '%s\n' "Назначение оставлено подключённым: синхронизация не подтверждена."
+        return 0
+    fi
+    printf '%s\n' "Назначение оставлено подключённым: идентичность назначения или разрешение системы не подтверждены."
 }
 
 quc_print_human() {
@@ -6745,13 +7963,13 @@ quc_fs_caution() {
             return 0
             ;;
         vfat|msdos|fat|msdosfs)
-            printf '%s\n' "FAT: имена и файлы больше 4 ГиБ могут быть пропущены. Полный обход имён до подтверждения запуска не делается."
+            printf '%s\n' "FAT: имена и файлы больше 4 ГиБ проверяются до запуска. Права Unix не сохраняются."
             ;;
         exfat)
-            printf '%s\n' "exFAT: часть имён может не сохраниться. Полный обход имён до подтверждения запуска не делается."
+            printf '%s\n' "exFAT: запрещённые имена и совпадение регистра проверяются до запуска. Права Unix не сохраняются."
             ;;
         ntfs|ntfs3|fuseblk)
-            printf '%s\n' "NTFS: права Unix не сохраняются. Это не запрет запуска."
+            printf '%s\n' "NTFS: права Unix не сохраняются. Запрещённые имена и совпадение регистра проверяются до запуска."
             ;;
         *)
             printf 'Файловая система непроверенного типа (%s). Обычные файлы возможны. Особые ограничения не проверялись.\n' "$(quc_display_path "$1")"
@@ -6869,12 +8087,38 @@ quc_menu_set_verdict() {
         return 0
     fi
     if [ -n "$quc_notes" ]; then
-        qm_reason=$(printf '%s\n' "$quc_notes" | "$quc_bin_awk" 'NF { print; exit }')
+        qm_reason=$(printf '%s\n' "$quc_notes" | "$quc_bin_awk" '
+            BEGIN { disk = "физический диск однозначно не определён; совпадение разделов не проверялось" }
+            {
+                if ($0 == "") next
+                if ($0 == disk) { has = 1; next }
+                print
+                found = 1
+                exit
+            }
+            END { if (!found && has) print disk }
+        ')
+        qm_verdict='Вердикт: можно копировать с ограничением.'
+        return 0
     fi
-    if [ -z "$qm_reason" ]; then
-        qm_reason='жёсткие ссылки на назначении не проверялись'
-    fi
-    qm_verdict='Вердикт: можно копировать с ограничением.'
+    case ${quc_dest_link_probe:-UNKNOWN} in
+        link)
+            qm_verdict='Проверка: можно начинать'
+            qm_reason=
+            ;;
+        exclusive)
+            qm_reason='новое имя создаётся сразу и проверяется после записи'
+            qm_verdict='Вердикт: можно копировать с ограничением.'
+            ;;
+        unsupported)
+            qm_reason='на этом назначении нельзя создать новое имя без риска замены'
+            qm_verdict='Вердикт: можно копировать с ограничением.'
+            ;;
+        *)
+            qm_reason='жёсткие ссылки на назначении не проверялись'
+            qm_verdict='Вердикт: можно копировать с ограничением.'
+            ;;
+    esac
     return 0
 }
 
@@ -6890,7 +8134,14 @@ quc_menu_show_details() {
     if [ -n "${quc_need_bytes:-}" ] && [ -n "${quc_free_have:-}" ]; then
         printf '  Данные: %s\n' "$(quc_human_bytes "$quc_need_bytes")"
         printf '  Свободно: %s\n' "$(quc_human_bytes "$quc_free_have")"
-        printf '%s\n' "  Свободное место: достаточно"
+        case $quc_problems in
+            *'недостаточно свободного места'*)
+                printf '%s\n' "  Свободное место: недостаточно"
+                ;;
+            *)
+                printf '%s\n' "  Свободное место: достаточно"
+                ;;
+        esac
     else
         printf '%s\n' "  Свободное место: не подтверждено"
     fi
@@ -6899,10 +8150,25 @@ quc_menu_show_details() {
         if [ -n "${quc_dest_rel:-}" ]; then
             printf '  Папка: %s\n' "$(quc_display_path "$quc_target/$quc_dest_rel")"
         fi
+    elif [ -n "${quc_target:-}" ] && [ ! -L "$quc_target" ] && quc_dir_nonempty "$quc_target"; then
+        printf '%s\n' "  Существующие файлы: на назначении уже есть данные, копирование в корень не начато"
     else
         printf '%s\n' "  Существующие файлы: назначение пустое"
     fi
-    printf '%s\n' "  Жёсткие ссылки на назначении: не проверялись"
+    case ${quc_dest_link_probe:-UNKNOWN} in
+        link)
+            printf '%s\n' "  Жёсткие ссылки на назначении: доступны"
+            ;;
+        exclusive)
+            printf '%s\n' "  Жёсткие ссылки на назначении: недоступны, новое имя создаётся сразу и проверяется после записи"
+            ;;
+        unsupported)
+            printf '%s\n' "  Жёсткие ссылки на назначении: создать новое имя без риска замены нельзя"
+            ;;
+        *)
+            printf '%s\n' "  Жёсткие ссылки на назначении: не проверялись"
+            ;;
+    esac
     printf '%s\n' "  Файловая система назначения: этой проверкой не подтверждена"
     if [ "${quc_stage_offer:-0}" = 1 ]; then
         printf '%s\n' "  Локальная копия: доступна, чтение по умолчанию с источника"
@@ -6939,6 +8205,8 @@ quc_menu_show_confirm() {
     printf '\n'
     quc_print_side "Источник" "$quc_menu_src"
     printf '\n'
+    printf '%s\n' "       ↓"
+    printf '\n'
     quc_print_side "Назначение" "$quc_menu_dst"
     printf '\n'
     quc_label_for_path "$quc_menu_src" "$quc_menu_file"
@@ -6947,13 +8215,13 @@ quc_menu_show_confirm() {
     qm_dst_name=$(quc_display_path "$quc_lp_label")
     printf 'Направление: %s → %s\n' "$qm_src_name" "$qm_dst_name"
     if [ -n "${quc_need_bytes:-}" ]; then
-        printf 'Копирование: %s\n' "$(quc_human_bytes "$quc_need_bytes")"
+        printf 'Данные: %s\n' "$(quc_human_bytes "$quc_need_bytes")"
         printf 'Свободно: %s\n' "$(quc_human_bytes "${quc_free_have:-0}")"
     else
-        printf '%s\n' "Копирование: не посчитано"
+        printf '%s\n' "Данные: не посчитано"
         printf '%s\n' "Свободно: не подтверждено"
     fi
-    printf '%s\n' "Режим: прямой"
+    printf '%s\n' "Режим: бережный"
     if [ "${quc_dest_mode:-root}" = separate ] && [ -n "${quc_dest_rel:-}" ]; then
         printf '%s\n' "Размещение: отдельная папка"
         printf 'Папка: %s\n' "$(quc_display_path "$quc_target/$quc_dest_rel")"
@@ -6962,8 +8230,12 @@ quc_menu_show_confirm() {
         printf '%s\n' "Размещение: корень назначения"
     fi
     printf '%s\n' "Существующие имена не заменяются."
+    if [ "$quc_preflight_ok" = 1 ] && [ "${quc_publish_mode:-}" = exclusive ]; then
+        printf '%s\n' "Жёсткие ссылки на назначении недоступны. Новый файл виден до проверки содержимого и не считается готовым."
+    fi
     if [ "${quc_eject_policy:-no}" = yes ]; then
         printf '%s\n' "Отключение назначения: включено"
+        printf '%s\n' "После копирования содержимое будет проверено. При успешной проверке программа попытается безопасно отключить назначение."
     else
         printf '%s\n' "Отключение назначения: выключено"
     fi
@@ -7074,6 +8346,14 @@ quc_cmd_interactive() {
             qm_caut=$(quc_fs_caution "$quc_target_fs" || true)
             if [ -n "$qm_caut" ]; then
                 quc_add_note "$qm_caut"
+            fi
+        fi
+        if [ "$quc_preflight_ok" = 1 ]; then
+            if ! quc_select_publish_mode "$quc_target"; then
+                quc_add_problem "${quc_error:-На этом назначении нельзя создать новое имя без риска замены. Копирование не начато.}"
+                quc_preflight_ok=0
+            elif [ "${quc_publish_mode:-}" = exclusive ]; then
+                quc_add_note "Жёсткие ссылки на назначении недоступны. Новый файл виден до проверки содержимого и не считается готовым."
             fi
         fi
         quc_note_pending_job
@@ -7415,7 +8695,7 @@ quc_cmd_doctor() {
     fi
     printf '%s\n' "Размещение по умолчанию: корень пустого назначения. Непустое — отдельная папка."
     printf '%s\n' "MERGE_SAFE=NOT_IMPLEMENTED"
-    printf '%s\n' "Публикация файла: существующее имя не заменяется. Новое имя — жёсткая ссылка или mv -n. Принудительное перемещение не используется."
+    printf '%s\n' "Публикация файла: существующее имя не заменяется. Если жёсткая ссылка доступна, новое имя создаётся ею. Если ссылки нет, новое имя создаётся один раз и сразу видно; оно не считается проверенным, пока содержимое не совпадёт. Это не атомарная публикация. Принудительное перемещение не используется."
     printf '%s\n' "publish_policy=no-replace"
     printf '%s\n' "dest_link_probe=UNKNOWN"
     printf '%s\n' "checks_not_run=dest_hardlink"
@@ -7532,6 +8812,19 @@ quc_cmd_selftest() {
     if [ -n "$caut" ]; then
         st_bad=$(quc_add_bytes "$st_bad" 1)
     fi
+    quc_fat_name_bad vfat 'CON' || st_bad=$(quc_add_bytes "$st_bad" 1)
+    quc_fat_name_bad exfat 'a:b' || st_bad=$(quc_add_bytes "$st_bad" 1)
+    quc_fat_name_bad ntfs 'a*b' || st_bad=$(quc_add_bytes "$st_bad" 1)
+    quc_fat_name_bad ext4 'a:b' && st_bad=$(quc_add_bytes "$st_bad" 1)
+    quc_fat_name_bad vfat 'my file.txt' && st_bad=$(quc_add_bytes "$st_bad" 1)
+    case $(quc_name_class tmpfs) in
+        posix) ;;
+        *) st_bad=$(quc_add_bytes "$st_bad" 1) ;;
+    esac
+    case $(quc_name_class exfat) in
+        exfat) ;;
+        *) st_bad=$(quc_add_bytes "$st_bad" 1) ;;
+    esac
     msg=$(quc_disk_pair_problem tmpfs tmpfs || true)
     if [ -n "$msg" ]; then
         st_bad=$(quc_add_bytes "$st_bad" 1)

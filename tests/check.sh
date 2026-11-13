@@ -1,7 +1,4 @@
 #!/bin/sh
-# SPDX-License-Identifier: GPL-3.0-or-later
-# Copyright (C) 2026 AdmiralGDR
-#
 # Dev-only project check. The copy program does not call this file.
 # It does not install packages and does not ask for a password.
 # Usage: sh tests/check.sh
@@ -51,8 +48,8 @@ mkdir -p "$HOME" "$XDG_STATE_HOME" "$XDG_RUNTIME_DIR" "$XDG_DATA_HOME" \
 printf 'a\n' > "$cli_work/src/a.txt" || fail=1
 
 ver_out=$(sh quiet_usb_copy.sh version) || fail=1
-printf '%s\n' "$ver_out" | grep -q 'quiet-usb-copy 0.4.0-rc.7' || fail=1
-printf '%s\n' "$ver_out" | grep -q 'build 20261108.2' || fail=1
+printf '%s\n' "$ver_out" | grep -q 'quiet-usb-copy 0.4.0-rc.10' || fail=1
+printf '%s\n' "$ver_out" | grep -q 'build 20261112.3' || fail=1
 printf '%s\n' "$ver_out" | grep -q '^sha256=' || fail=1
 
 help_out=$(sh quiet_usb_copy.sh help) || fail=1
@@ -113,7 +110,7 @@ fi
 # rollback/ exists only in a developer working copy.
 # A published tree has no such directory; these checks are skipped.
 note "rollback trees"
-for tree in rollback/0.3.0 rollback/0.4.0-rc.2 rollback/0.4.0-rc.3 rollback/0.4.0-rc.4 rollback/0.4.0-rc.5 rollback/0.4.0-rc.6 rollback/0.4.0-rc.7; do
+for tree in rollback/0.3.0 rollback/0.4.0-rc.2 rollback/0.4.0-rc.3 rollback/0.4.0-rc.4 rollback/0.4.0-rc.5 rollback/0.4.0-rc.6 rollback/0.4.0-rc.7 rollback/0.4.0-rc.8 rollback/0.4.0-rc.9 rollback/0.4.0-rc.10; do
     if [ ! -d "$tree" ]; then
         note "SKIP $tree"
         continue

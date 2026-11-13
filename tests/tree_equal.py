@@ -1,7 +1,4 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-3.0-or-later
-# Copyright (C) 2026 AdmiralGDR
-#
 """Compare two directory trees without following symlinks or other filesystems.
 
 Filenames are hex-encoded so newlines and odd bytes stay on one manifest line.

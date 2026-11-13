@@ -1,6 +1,3 @@
-/* SPDX-License-Identifier: GPL-3.0-or-later */
-/* Copyright (C) 2026 AdmiralGDR */
-
 #define _GNU_SOURCE
 #include <dlfcn.h>
 #include <errno.h>

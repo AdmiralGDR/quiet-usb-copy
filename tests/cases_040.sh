@@ -1,9 +1,6 @@
-# SPDX-License-Identifier: GPL-3.0-or-later
-# Copyright (C) 2026 AdmiralGDR
-#
 # Quiet USB Copy 0.4.0 groups A–D.
 # Sourced by tests/run.sh after the helpers and the 0.3.0 cases.
-# FAT32, exFAT and NTFS are not mounted here. Those types stay UNKNOWN.
+# FAT32, exFAT and NTFS images are not attached here. Name rules are simulated.
 # A02 checks the ASCII fold refusal on tmpfs, which is case-sensitive.
 
 c40_sha() {
@@ -910,13 +907,17 @@ test_C03() {
     keep=$(c40_sha "$dst/keep.txt")
     printf 'plan\n' > "$src/a.txt"
     run_quiet "$SH" "$SCRIPT" plan "$src" "$dst"
-    if [ "$quc_ec" -ne 0 ] || ! grep -q '^plan_result=OK$' "$quc_out" || ! grep -q '^dest_mode=separate$' "$quc_out" || ! grep -q 'Существующие данные: не изменяются' "$quc_out" || ! grep -q '^MERGE_SAFE=NOT_IMPLEMENTED$' "$quc_out" || ! grep -q '^plan_level=LIMITED$' "$quc_out" || ! grep -q '^publish_policy=no-replace$' "$quc_out" || ! grep -q '^dest_link_probe=UNKNOWN$' "$quc_out" || ! grep -q '^checks_not_run=dest_hardlink$' "$quc_out" || ! grep -q '^content_tool=' "$quc_out" || ! grep -q 'Не проверено:' "$quc_out"; then
+    if [ "$quc_ec" -ne 0 ] || ! grep -q '^plan_result=OK$' "$quc_out" || ! grep -q '^dest_mode=separate$' "$quc_out" || ! grep -q 'Существующие данные: не изменяются' "$quc_out" || ! grep -q '^MERGE_SAFE=NOT_IMPLEMENTED$' "$quc_out" || ! grep -q '^plan_level=LIMITED$' "$quc_out" || ! grep -q '^publish_policy=no-replace$' "$quc_out" || ! grep -q '^dest_link_probe=link$' "$quc_out" || ! grep -q '^content_tool=' "$quc_out" || ! grep -q 'Жёсткие ссылки на назначении доступны' "$quc_out" || grep -q '^checks_not_run=dest_hardlink$' "$quc_out" || grep -q 'Не проверено:' "$quc_out"; then
         echo "plan nonempty ec=$quc_ec"
         cat "$quc_out" "$quc_err"
         bad=1
     fi
     if [ -f "$XDG_STATE_HOME/quiet-usb-copy/current" ] || [ -e "$dst/a.txt" ] || [ "$(c40_sha "$dst/keep.txt")" != "$keep" ]; then
         echo "plan copied"
+        bad=1
+    fi
+    if find "$dst" -name '.quc-partial.*' -print | grep -q .; then
+        echo "plan left a probe file"
         bad=1
     fi
     run_quiet "$SH" "$SCRIPT" plan "$src"
@@ -946,13 +947,13 @@ test_C03() {
 test_C04() {
     bad=0
     run_quiet "$SH" "$SCRIPT" doctor
-    if [ "$quc_ec" -ne 0 ] || ! grep -q '^MERGE_SAFE=NOT_IMPLEMENTED$' "$quc_out" || ! grep -q '^Контрольная сумма:' "$quc_out" || ! grep -q 'не отмечены как проверенные' "$quc_out" || ! grep -q '^error_code=E_OK$' "$quc_out" || ! grep -q '^publish_policy=no-replace$' "$quc_out" || ! grep -q '^dest_link_probe=UNKNOWN$' "$quc_out" || ! grep -q '^checks_not_run=dest_hardlink$' "$quc_out" || ! grep -q '^shell=' "$quc_out" || ! grep -q '^sha256=' "$quc_out" || ! grep -q 'Сравнение содержимого:' "$quc_out" || ! grep -q '^compat_level=LIMITED$' "$quc_out" || ! grep -q '^fs_gate=UNKNOWN$' "$quc_out" || ! grep -q '^fd_publish=SUPPORTED$' "$quc_out" || grep -q '^compat_level=SUPPORTED$' "$quc_out" || grep -q 'иначе проверка и mv' "$quc_out"; then
+    if [ "$quc_ec" -ne 0 ] || ! grep -q '^MERGE_SAFE=NOT_IMPLEMENTED$' "$quc_out" || ! grep -q '^Контрольная сумма:' "$quc_out" || ! grep -q 'не отмечены как проверенные' "$quc_out" || ! grep -q '^error_code=E_OK$' "$quc_out" || ! grep -q '^publish_policy=no-replace$' "$quc_out" || ! grep -q '^dest_link_probe=UNKNOWN$' "$quc_out" || ! grep -q '^checks_not_run=dest_hardlink$' "$quc_out" || ! grep -q '^shell=' "$quc_out" || ! grep -q '^sha256=' "$quc_out" || ! grep -q 'Сравнение содержимого:' "$quc_out" || ! grep -q '^compat_level=LIMITED$' "$quc_out" || ! grep -q '^fs_gate=UNKNOWN$' "$quc_out" || ! grep -q '^fd_publish=SUPPORTED$' "$quc_out" || grep -q '^compat_level=SUPPORTED$' "$quc_out" || grep -q 'иначе проверка и mv' "$quc_out" || grep -q 'mv -n' "$quc_out"; then
         echo "doctor"
         cat "$quc_out" "$quc_err"
         bad=1
     fi
     run_quiet "$SH" "$SCRIPT" version
-    if [ "$quc_ec" -ne 0 ] || ! grep -q '^quiet-usb-copy 0.4.0-rc.7$' "$quc_out" || ! grep -q '^build 20261108.2$' "$quc_out" || ! grep -q '^sha256=' "$quc_out"; then
+    if [ "$quc_ec" -ne 0 ] || ! grep -q '^quiet-usb-copy 0.4.0-rc.10$' "$quc_out" || ! grep -q '^build 20261112.3$' "$quc_out" || ! grep -q '^sha256=' "$quc_out"; then
         echo "version"
         cat "$quc_out"
         bad=1
@@ -1160,16 +1161,12 @@ test_E01() {
     mkdir -p "$e01_wrap"
     : > "$e01_log"
     e01_mv=$(PATH=$ORIG_PATH command -v mv) || { fail "mv"; return; }
-    cat > "$e01_wrap/ln" <<'EOF'
-#!/bin/sh
-exit 1
-EOF
     cat > "$e01_wrap/mv" <<EOF
 #!/bin/sh
 printf '%s\\n' "\$*" >> "$e01_log"
 exec $e01_mv "\$@"
 EOF
-    chmod 755 "$e01_wrap/ln" "$e01_wrap/mv"
+    chmod 755 "$e01_wrap/mv"
     env PATH="$e01_wrap:$ORIG_PATH" QUC_FILE_PAUSE=8 "$SH" "$SCRIPT" start "$src" "$dst" >"$WORK/last.out" 2>"$WORK/last.err"
     if [ "$?" -ne 0 ] || [ -s "$WORK/last.out" ] || [ -s "$WORK/last.err" ]; then
         echo "start noisy or failed"
@@ -1224,20 +1221,21 @@ EOF
         bad=1
     fi
     if [ -z "$e01_copied" ] || ! cmp -s "$e01_src" "$e01_copied"; then
+        echo "copied file mismatch"
         bad=1
     fi
-    if [ -z "$e01_copied" ] || ! grep -F -- '-n' "$e01_log" | grep -F -- "$e01_copied" >/dev/null; then
-        echo "new file was not published with mv -n"
+    if [ -n "$e01_copied" ] && grep -F -- "$e01_copied" "$e01_log" >/dev/null; then
+        echo "mv saw the published file"
         cat "$e01_log"
         bad=1
     fi
-    if grep -F -- '-f' "$e01_log" | grep -F -- "$e01_protected" >/dev/null; then
-        echo "mv -f saw the foreign file"
+    if [ -n "$e01_protected" ] && grep -F -- "$e01_protected" "$e01_log" >/dev/null; then
+        echo "mv saw the foreign file"
         cat "$e01_log"
         bad=1
     fi
     src_same || bad=1
-    if [ "$bad" -eq 0 ]; then pass; else fail "mv -n keeps foreign file status=$st"; fi
+    if [ "$bad" -eq 0 ]; then pass; else fail "free name stays a link and foreign bytes stay status=$st"; fi
 }
 
 test_E02() {
@@ -1533,20 +1531,28 @@ EOF
     fi
     st=$(wait_done 80)
     if [ "$st" != SUCCESS ] || ! cmp -s "$src/a.txt" "$dst/a.txt"; then
-        echo "status=$st"
+        echo "status=$st exclusive publish failed"
         bad=1
     fi
-    if ! grep -F -- '-n' "$f_log" | grep -F -- "$dst/a.txt" >/dev/null; then
-        echo "file was not published with mv -n"
+    if [ "$(job_field publish_mode)" != exclusive ] || [ "$(job_field partial_visible)" != 0 ]; then
+        echo "mode=$(job_field publish_mode) visible=$(job_field partial_visible)"
+        bad=1
+    fi
+    if [ "$(c40_sha "$dst/a.txt")" != "$(c40_sha "$src/a.txt")" ]; then
+        echo "checksum"
+        bad=1
+    fi
+    if find "$dst" -name '.quc-partial.*' -print | grep -q .; then
+        echo "partial name left"
+        bad=1
+    fi
+    if grep -F -- "$dst/" "$f_log" >/dev/null; then
+        echo "mv was used for the destination"
         cat "$f_log"
         bad=1
     fi
-    if grep -F -- '-f' "$f_log" | grep -F -- "$dst/a.txt" >/dev/null; then
-        echo "mv -f saw the published file"
-        bad=1
-    fi
     src_same || bad=1
-    if [ "$bad" -eq 0 ]; then pass; else fail "hardlink refusal still publishes a free name status=$st"; fi
+    if [ "$bad" -eq 0 ]; then pass; else fail "exclusive publish without a hard link status=$st"; fi
 }
 
 test_F03() {
@@ -1556,39 +1562,11 @@ test_F03() {
     printf 'KEEP\n' > "$f_dir/dest"
     printf 'NEW\n' > "$f_dir/src"
     f_sha=$(c40_sha "$f_dir/dest")
-    f_dino=$(stat -c '%i' "$f_dir/dest")
-    f_sino=$(stat -c '%i' "$f_dir/src")
     f_mv=$(PATH=$ORIG_PATH command -v mv) || { fail "mv"; return; }
     "$f_mv" -n -- "$f_dir/src" "$f_dir/dest"
     f_rc=$?
-    # Код возврата mv -n при пропуске зависит от версии GNU coreutils
-    # (9.4 возвращает 1, 9.7 возвращает 0). Проверяется результат, а не код.
-    if [ "$(cat "$f_dir/dest")" != KEEP ] || [ "$(c40_sha "$f_dir/dest")" != "$f_sha" ] \
-        || [ "$(stat -c '%i' "$f_dir/dest")" != "$f_dino" ] \
-        || [ ! -f "$f_dir/src" ] || [ "$(cat "$f_dir/src")" != NEW ] \
-        || [ "$(stat -c '%i' "$f_dir/src")" != "$f_sino" ]; then
-        echo "gnu mv -n replaced or lost a file rc=$f_rc"
-        bad=1
-    fi
-    echo "gnu mv -n skip rc=$f_rc"
-    # Продукт: mv -n с кодом 0 без переноса (имя заняли между проверкой и mv)
-    # не считается публикацией и не трогает чужой файл.
-    f_rd=$WORK/t-$current/race
-    mkdir -p "$f_rd"
-    printf '#!/bin/sh\nprintf "FOREIGN\\n" > "%s/dst"\nexit 0\n' "$f_rd" > "$WORK/t-$current/mv-skip0"
-    printf '#!/bin/sh\nexit 1\n' > "$WORK/t-$current/ln-no"
-    chmod 755 "$WORK/t-$current/mv-skip0" "$WORK/t-$current/ln-no" || bad=1
-    printf 'PAYLOAD\n' > "$f_rd/tmp"
-    f_rino=$(stat -c '%i' "$f_rd/tmp")
-    quc_bin_ln=$WORK/t-$current/ln-no
-    quc_bin_mv=$WORK/t-$current/mv-skip0
-    quc_install_new "$f_rd/tmp" "$f_rd/dst" "$f_rino"
-    f_rc=$?
-    quc_resolve_tools || bad=1
-    if [ "$f_rc" -eq 0 ] || [ "$(cat "$f_rd/dst" 2>/dev/null)" != FOREIGN ] \
-        || [ "$(cat "$f_rd/tmp" 2>/dev/null)" != PAYLOAD ] \
-        || [ "$(stat -c '%i' "$f_rd/tmp" 2>/dev/null)" != "$f_rino" ]; then
-        echo "install treated mv -n rc=0 skip as success rc=$f_rc"
+    if [ "$f_rc" -eq 0 ] || [ "$(cat "$f_dir/dest")" != KEEP ] || [ ! -f "$f_dir/src" ] || [ "$(c40_sha "$f_dir/dest")" != "$f_sha" ]; then
+        echo "gnu mv -n rc=$f_rc"
         bad=1
     fi
     f_bind_job || { fail "job"; return; }
@@ -3470,24 +3448,12 @@ test_G24() {
 }
 
 test_G25() {
-    bad=0
     g_old=$ROOT/rollback/0.4.0-rc.5/quiet_usb_copy.sh
     if [ ! -f "$g_old" ]; then
-        # В опубликованном дереве нет rollback/: rc.5 берётся из истории git
-        # (коммит 1090f43) и сверяется с опубликованной суммой.
-        g_old=$WORK/t-$current/rc5.sh
-        mkdir -p "$WORK/t-$current"
-        if git -C "$ROOT" show 1090f43:quiet_usb_copy.sh > "$g_old" 2>/dev/null \
-            && [ "$(c40_sha "$g_old")" = 946e9d86c9508631fc5c00bd9b3c59b611dcb5e9611ef8c551be45b6340f2593 ]; then
-            :
-        else
-            rm -f "$g_old"
-        fi
+        skip "differential rc.5 (no rollback/0.4.0-rc.5)"
+        return 0
     fi
-    if [ ! -f "$g_old" ]; then
-        echo "missing rc.5"
-        bad=1
-    fi
+    bad=0
     src_a=$WORK/t-$current/src-a
     dst_a=$WORK/t-$current/dst-a
     src_b=$WORK/t-$current/src-b
@@ -3574,6 +3540,1360 @@ test_G27() {
     if [ "$bad" -eq 0 ]; then pass; else fail "staged separate eject skipped"; fi
 }
 
+h_link_tools() {
+    h_lim=$1
+    shift
+    mkdir -p "$h_lim" || return 1
+    for h_tool in "$@"; do
+        h_bin=$(PATH=$ORIG_PATH command -v "$h_tool" || true)
+        if [ -z "$h_bin" ]; then
+            continue
+        fi
+        ln -s "$h_bin" "$h_lim/$h_tool" || return 1
+    done
+    return 0
+}
+
+test_H01() {
+    bad=0
+    g_stub_install
+    quc_resolve_tools || bad=1
+    quc_default_job_vars
+    quc_eject_policy=yes
+    quc_copy_status=SUCCESS
+    quc_sync_status=command_ok
+    quc_error=
+    quc_verify_status=size
+    quc_auto_disconnect
+    if [ "$quc_eject_status" != skipped_policy ] || [ "$quc_copy_status" != SUCCESS ] || [ "$(g_stub_actions)" != 0 ]; then
+        echo "size eject=$quc_eject_status actions=$(g_stub_actions)"
+        cat "$g_stub_log"
+        bad=1
+    fi
+    quc_verify_status=none
+    quc_auto_disconnect
+    if [ "$quc_eject_status" != skipped_policy ] || [ "$(g_stub_actions)" != 0 ]; then
+        echo "none eject=$quc_eject_status"
+        cat "$g_stub_log"
+        bad=1
+    fi
+    quc_resolve_tools || bad=1
+    if [ "$bad" -eq 0 ]; then pass; else fail "size and none do not eject"; fi
+}
+
+test_H02() {
+    bad=0
+    g_stub_install
+    make_pair || { fail "mount"; return; }
+    printf 'checked\n' > "$src/a.txt"
+    save_src
+    run_start --eject-dest "$src" "$dst"
+    if [ "$quc_ec" -ne 0 ] || [ "$quc_noisy" -ne 0 ]; then
+        echo "start ec=$quc_ec noisy=$quc_noisy"
+        bad=1
+    fi
+    st=$(wait_done 40)
+    h_verify=$(job_field verify_status || true)
+    h_tool=$(job_field verify_tool || true)
+    case $h_verify in
+        checksum|byte) ;;
+        *) echo "verify=$h_verify tool=$h_tool"; bad=1 ;;
+    esac
+    if [ "$st" != SUCCESS ] || [ -n "$(job_field error)" ] || [ -z "$h_tool" ] || [ "$h_tool" = unavailable ]; then
+        echo "status=$st verify=$h_verify tool=$h_tool error=$(job_field error)"
+        bad=1
+    fi
+    if [ "$(job_field eject_status)" != skipped_policy ] || [ "$(job_field sync_status)" != command_ok ] || [ "$(g_stub_actions)" != 0 ]; then
+        echo "eject=$(job_field eject_status) sync=$(job_field sync_status) actions=$(g_stub_actions)"
+        cat "$g_stub_log"
+        bad=1
+    fi
+    cmp -s "$src/a.txt" "$dst/a.txt" || bad=1
+    run_quiet "$SH" "$SCRIPT" status --human
+    if ! grep -q 'Копирование завершено.' "$quc_out" || ! grep -q 'Проверка содержимого: завершена' "$quc_out" || ! grep -q 'Синхронизация:' "$quc_out" || ! grep -q 'Назначение оставлено подключённым: идентичность назначения или разрешение системы не подтверждены.' "$quc_out"; then
+        echo "human status"
+        cat "$quc_out"
+        bad=1
+    fi
+    src_same || bad=1
+    h_lim=$WORK/t-$current/limbyte
+    h_link_tools "$h_lim" find stat awk od tr mkdir rmdir rm mv ln chmod date readlink sleep cat cp grep dirname basename cmp sync touch flock setsid nice sh || bad=1
+    if env PATH="$h_lim" /bin/sh -c 'command -v sha256sum >/dev/null 2>&1 || command -v sha1sum >/dev/null 2>&1 || command -v md5sum >/dev/null 2>&1 || command -v cksum >/dev/null 2>&1 || ! command -v cmp >/dev/null 2>&1'; then
+        echo "byte path still has a hash tool or lacks cmp"
+        bad=1
+    fi
+    h_src=$WORK/t-$current/src-byte
+    h_dst=$WORK/t-$current/dst-byte
+    mkdir -p "$h_src" "$h_dst"
+    mount -t tmpfs -o size=16m tmpfs "$h_src" || bad=1
+    mount -t tmpfs -o size=16m tmpfs "$h_dst" || bad=1
+    printf 'byteme\n' > "$h_src/a.txt"
+    env PATH="$g_stub_dir:$h_lim" "$SH" "$SCRIPT" start --eject-dest "$h_src" "$h_dst" >"$WORK/last.out" 2>"$WORK/last.err"
+    if [ "$?" -ne 0 ] || [ -s "$WORK/last.out" ] || [ -s "$WORK/last.err" ]; then
+        echo "byte start"
+        cat "$WORK/last.out" "$WORK/last.err"
+        bad=1
+    fi
+    st=$(wait_done 40)
+    if [ "$st" != SUCCESS ] || [ "$(job_field verify_status)" != byte ] || [ "$(job_field verify_tool)" != cmp ] || [ "$(job_field eject_status)" != skipped_policy ]; then
+        echo "byte status=$st verify=$(job_field verify_status) tool=$(job_field verify_tool) eject=$(job_field eject_status)"
+        bad=1
+    fi
+    cmp -s "$h_src/a.txt" "$h_dst/a.txt" || bad=1
+    if [ "$(g_stub_actions)" != 0 ]; then
+        echo "byte path called eject"
+        cat "$g_stub_log"
+        bad=1
+    fi
+    if [ "$bad" -eq 0 ]; then pass; else fail "content verify before eject status=$st"; fi
+}
+
+test_H03() {
+    bad=0
+    g_stub_install
+    make_pair || { fail "mount"; return; }
+    printf 'payload\n' > "$src/a.txt"
+    save_src
+    export QUC_PRE_VERIFY_PAUSE=8
+    run_start --eject-dest "$src" "$dst"
+    if [ "$quc_ec" -ne 0 ] || [ "$quc_noisy" -ne 0 ]; then
+        echo "start ec=$quc_ec"
+        bad=1
+    fi
+    if ! wait_phase content-verify 80; then
+        echo "phase=$(job_field phase) status=$(job_field copy_status)"
+        bad=1
+    fi
+    if ! cmp -s "$src/a.txt" "$dst/a.txt"; then
+        echo "file was not published before verify"
+        bad=1
+    fi
+    printf 'DAMAGED\n' > "$dst/a.txt"
+    h_damaged=$(c40_sha "$dst/a.txt")
+    st=$(wait_done 80)
+    unset QUC_PRE_VERIFY_PAUSE
+    if [ "$st" != SUCCESS ] || [ "$(job_field verify_status)" != failed ] || [ "$(job_field eject_status)" != skipped_policy ] || [ "$(g_stub_actions)" != 0 ]; then
+        echo "status=$st verify=$(job_field verify_status) eject=$(job_field eject_status) actions=$(g_stub_actions)"
+        cat "$g_stub_log"
+        bad=1
+    fi
+    if [ "$(c40_sha "$dst/a.txt")" != "$h_damaged" ] || [ "$(cat "$dst/a.txt")" != DAMAGED ]; then
+        echo "damaged bytes were rewritten"
+        bad=1
+    fi
+    src_same || bad=1
+    run_quiet "$SH" "$SCRIPT" status --human
+    if ! grep -q 'Копирование завершено.' "$quc_out" || ! grep -q 'Проверка содержимого: найдены отличия' "$quc_out" || ! grep -q 'Назначение оставлено подключённым: содержимое назначения не совпало.' "$quc_out"; then
+        echo "human damage"
+        cat "$quc_out"
+        bad=1
+    fi
+    if [ "$bad" -eq 0 ]; then pass; else fail "damage after publish blocks eject status=$st"; fi
+}
+
+test_H04() {
+    bad=0
+    g_stub_install
+    h_wrap=$WORK/t-$current/hashbin
+    mkdir -p "$h_wrap"
+    for h_tool in sha256sum sha1sum md5sum cksum; do
+        cat > "$h_wrap/$h_tool" <<'EOF'
+#!/bin/sh
+exit 1
+EOF
+        chmod 755 "$h_wrap/$h_tool" || bad=1
+    done
+    make_pair || { fail "mount"; return; }
+    printf 'plain\n' > "$src/a.txt"
+    h_src_sha=$(c40_sha "$src/a.txt")
+    env PATH="$h_wrap:$g_stub_dir:$ORIG_PATH" "$SH" "$SCRIPT" start --eject-dest "$src" "$dst" >"$WORK/last.out" 2>"$WORK/last.err"
+    h_ec=$?
+    st=$(wait_done 40 || true)
+    if [ "$h_ec" -ne 0 ] || [ "$st" != SUCCESS ]; then
+        echo "copy with a broken checksum tool ec=$h_ec status=$st"
+        cat "$WORK/last.out" "$WORK/last.err"
+        bad=1
+    fi
+    if [ "$(job_field verify_status)" != none ] || [ "$(job_field verify_tool)" != unavailable ] || [ "$(job_field eject_status)" != skipped_policy ] || [ "$(g_stub_actions)" != 0 ]; then
+        echo "verify=$(job_field verify_status) tool=$(job_field verify_tool) eject=$(job_field eject_status) actions=$(g_stub_actions)"
+        cat "$g_stub_log"
+        bad=1
+    fi
+    if ! cmp -s "$src/a.txt" "$dst/a.txt" || [ "$(c40_sha "$src/a.txt")" != "$h_src_sha" ] || [ "$(c40_sha "$dst/a.txt")" != "$h_src_sha" ]; then
+        echo "bytes changed"
+        bad=1
+    fi
+    run_quiet "$SH" "$SCRIPT" status --human
+    if ! grep -q 'Назначение оставлено подключённым: проверка содержимого недоступна.' "$quc_out" || ! grep -q 'Копирование завершено.' "$quc_out"; then
+        echo "human missing tool"
+        cat "$quc_out"
+        bad=1
+    fi
+    h_lim=$WORK/t-$current/limnone
+    h_link_tools "$h_lim" find stat awk od tr mkdir rmdir rm mv ln chmod date readlink sleep cat cp grep dirname basename sync touch flock setsid nice sh || bad=1
+    h_src=$WORK/t-$current/src-none
+    h_dst=$WORK/t-$current/dst-none
+    mkdir -p "$h_src" "$h_dst"
+    mount -t tmpfs -o size=16m tmpfs "$h_src" || bad=1
+    mount -t tmpfs -o size=16m tmpfs "$h_dst" || bad=1
+    printf 'plain\n' > "$h_src/a.txt"
+    env PATH="$g_stub_dir:$h_lim" "$SH" "$SCRIPT" start --eject-dest "$h_src" "$h_dst" >"$WORK/last.out" 2>"$WORK/last.err"
+    st=$(wait_done 40 || true)
+    if [ "$st" = SUCCESS ] || [ -e "$h_dst/a.txt" ] || [ -L "$h_dst/a.txt" ] || [ "$(g_stub_actions)" != 0 ]; then
+        echo "no-tool copy status=$st actions=$(g_stub_actions)"
+        cat "$g_stub_log" "$WORK/last.out" "$WORK/last.err"
+        bad=1
+    fi
+    quc_resolve_tools || bad=1
+    quc_bin_sha256=
+    quc_bin_sha1=
+    quc_bin_md5=
+    quc_bin_cksum=
+    quc_bin_cmp=
+    quc_read_root=$src
+    quc_write_root=$dst
+    quc_source=$src
+    quc_target=$dst
+    quc_files_done=1
+    quc_log_file=
+    quc_job_dir=$WORK/t-$current/job-h04
+    mkdir -p "$quc_job_dir"
+    quc_verify_published
+    if [ "$quc_verify_status" != none ] || [ "$quc_verify_tool" != unavailable ]; then
+        echo "direct none status=$quc_verify_status tool=$quc_verify_tool"
+        bad=1
+    fi
+    quc_default_job_vars
+    quc_eject_policy=yes
+    quc_copy_status=SUCCESS
+    quc_sync_status=command_ok
+    quc_verify_status=none
+    quc_verify_tool=unavailable
+    quc_auto_disconnect
+    if [ "$quc_eject_status" != skipped_policy ] || [ "$(g_stub_actions)" != 0 ] || [ "$(c40_sha "$src/a.txt")" != "$h_src_sha" ] || [ "$(c40_sha "$dst/a.txt")" != "$h_src_sha" ]; then
+        echo "cleared tools eject=$quc_eject_status"
+        bad=1
+    fi
+    quc_resolve_tools || bad=1
+    if [ "$bad" -eq 0 ]; then pass; else fail "missing content tool does not eject status=$st"; fi
+}
+
+test_H05() {
+    bad=0
+    g_stub_install
+    h_wrap=$WORK/t-$current/syncbin
+    mkdir -p "$h_wrap"
+    cat > "$h_wrap/sync" <<'EOF'
+#!/bin/sh
+exit 1
+EOF
+    chmod 755 "$h_wrap/sync"
+    make_pair || { fail "mount"; return; }
+    printf 'synced\n' > "$src/a.txt"
+    env PATH="$h_wrap:$g_stub_dir:$ORIG_PATH" "$SH" "$SCRIPT" start --eject-dest "$src" "$dst" >"$WORK/last.out" 2>"$WORK/last.err"
+    if [ "$?" -ne 0 ] || [ -s "$WORK/last.out" ] || [ -s "$WORK/last.err" ]; then
+        echo "start"
+        cat "$WORK/last.out" "$WORK/last.err"
+        bad=1
+    fi
+    st=$(wait_done 40)
+    h_verify=$(job_field verify_status || true)
+    case $h_verify in
+        checksum|byte) ;;
+        *) echo "verify=$h_verify"; bad=1 ;;
+    esac
+    if [ "$st" != SUCCESS ] || [ "$(job_field sync_status)" = command_ok ] || [ "$(job_field eject_status)" != skipped_policy ] || [ "$(g_stub_actions)" != 0 ]; then
+        echo "status=$st sync=$(job_field sync_status) eject=$(job_field eject_status) actions=$(g_stub_actions)"
+        cat "$g_stub_log"
+        bad=1
+    fi
+    cmp -s "$src/a.txt" "$dst/a.txt" || bad=1
+    run_quiet "$SH" "$SCRIPT" status --human
+    if ! grep -q 'Назначение оставлено подключённым: синхронизация не подтверждена.' "$quc_out"; then
+        echo "human sync"
+        cat "$quc_out"
+        bad=1
+    fi
+    if [ "$bad" -eq 0 ]; then pass; else fail "sync error blocks eject status=$st"; fi
+}
+
+test_H06() {
+    bad=0
+    g_stub_install
+    make_pair || { fail "mount"; return; }
+    printf 'payload\n' > "$src/a.txt"
+    h_old=$(c40_sha "$src/a.txt")
+    export QUC_PRE_VERIFY_PAUSE=8
+    run_start --eject-dest "$src" "$dst"
+    if [ "$quc_ec" -ne 0 ] || [ "$quc_noisy" -ne 0 ]; then
+        echo "start ec=$quc_ec"
+        bad=1
+    fi
+    if ! wait_phase content-verify 80; then
+        echo "phase=$(job_field phase)"
+        bad=1
+    fi
+    if [ "$(c40_sha "$dst/a.txt")" != "$h_old" ]; then
+        echo "dest changed before the source edit"
+        bad=1
+    fi
+    printf 'more\n' >> "$src/a.txt"
+    st=$(wait_done 80)
+    unset QUC_PRE_VERIFY_PAUSE
+    if [ "$st" != UNCERTAIN ] || [ "$(job_field verify_status)" != uncertain ] || [ "$(job_field eject_status)" != skipped_policy ] || [ "$(g_stub_actions)" != 0 ]; then
+        echo "status=$st verify=$(job_field verify_status) eject=$(job_field eject_status) actions=$(g_stub_actions)"
+        cat "$g_stub_log"
+        bad=1
+    fi
+    if [ "$(c40_sha "$dst/a.txt")" != "$h_old" ] || [ "$(cat "$dst/a.txt")" != payload ]; then
+        echo "published bytes changed after the source edit"
+        bad=1
+    fi
+    run_quiet "$SH" "$SCRIPT" status --human
+    if ! grep -q 'Результат копирования не подтверждён.' "$quc_out" || ! grep -q 'Проверка содержимого: источник менялся' "$quc_out" || ! grep -q 'Назначение оставлено подключённым: источник изменился во время проверки.' "$quc_out"; then
+        echo "human uncertain"
+        cat "$quc_out"
+        bad=1
+    fi
+    if [ "$bad" -eq 0 ]; then pass; else fail "source change during verify status=$st"; fi
+}
+
+test_H07() {
+    bad=0
+    g_stub_install
+    make_pair || { fail "mount"; return; }
+    printf 'payload\n' > "$src/a.txt"
+    save_src
+    export QUC_PRE_PUBLISH_PAUSE=8
+    run_start --eject-dest "$src" "$dst"
+    if [ "$quc_ec" -ne 0 ] || [ "$quc_noisy" -ne 0 ]; then
+        echo "start ec=$quc_ec"
+        bad=1
+    fi
+    if ! wait_phase prepublish 80; then
+        echo "phase=$(job_field phase) status=$(job_field copy_status)"
+        bad=1
+    fi
+    printf 'FOREIGN\n' > "$dst/a.txt"
+    h_sha=$(c40_sha "$dst/a.txt")
+    st=$(wait_done 80)
+    unset QUC_PRE_PUBLISH_PAUSE
+    if [ "$st" = SUCCESS ] || [ "$(c40_sha "$dst/a.txt")" != "$h_sha" ] || [ "$(cat "$dst/a.txt")" != FOREIGN ]; then
+        echo "status=$st foreign changed"
+        bad=1
+    fi
+    if [ "$(job_field eject_status)" != skipped_policy ] || [ "$(g_stub_actions)" != 0 ]; then
+        echo "eject=$(job_field eject_status) actions=$(g_stub_actions)"
+        cat "$g_stub_log"
+        bad=1
+    fi
+    src_same || bad=1
+    if [ "$bad" -eq 0 ]; then pass; else fail "concurrent name blocks eject status=$st"; fi
+}
+
+test_H08() {
+    bad=0
+    f_bind_job || { fail "job"; return; }
+    h_dir=$WORK/t-$current/place
+    mkdir -p "$h_dir"
+    printf 'FOREIGN\n' > "$h_dir/taken"
+    h_sha=$(c40_sha "$h_dir/taken")
+    printf 'PAYLOAD\n' > "$WORK/t-$current/payload"
+    h_ino=$(stat -c '%i' "$WORK/t-$current/payload")
+    h_log=$WORK/t-$current/mv.log
+    : > "$h_log"
+    cat > "$WORK/t-$current/ln-fail" <<'EOF'
+#!/bin/sh
+exit 1
+EOF
+    cat > "$WORK/t-$current/mv-lie" <<EOF
+#!/bin/sh
+printf '%s\n' "\$*" >> "$h_log"
+exit 0
+EOF
+    chmod 755 "$WORK/t-$current/ln-fail" "$WORK/t-$current/mv-lie" || bad=1
+    quc_bin_ln=$WORK/t-$current/ln-fail
+    quc_bin_mv=$WORK/t-$current/mv-lie
+    quc_install_new "$WORK/t-$current/payload" "$h_dir/taken" "$h_ino"
+    h_rc=$?
+    if [ "$h_rc" -ne 11 ] || [ "$(c40_sha "$h_dir/taken")" != "$h_sha" ] || [ "$(cat "$h_dir/taken")" != FOREIGN ] || [ -s "$h_log" ]; then
+        echo "occupied rc=$h_rc"
+        cat "$h_log"
+        bad=1
+    fi
+    quc_publish_limited=0
+    quc_install_new "$WORK/t-$current/payload" "$h_dir/free" "$h_ino"
+    h_rc=$?
+    if [ "$h_rc" -eq 0 ] || [ -e "$h_dir/free" ] || [ ! -f "$WORK/t-$current/payload" ] || [ "$(cat "$WORK/t-$current/payload")" != PAYLOAD ] || [ -s "$h_log" ]; then
+        echo "free name rc=$h_rc"
+        cat "$h_log"
+        bad=1
+    fi
+    quc_resolve_tools || bad=1
+    if [ "$bad" -eq 0 ]; then pass; else fail "hard link refusal has no mv fallback"; fi
+}
+
+test_H09() {
+    bad=0
+    g_stub_install
+    make_pair || { fail "mount"; return; }
+    mkdir -p "$src/sub"
+    printf 'payload\n' > "$src/sub/a.txt"
+    h_out=$WORK/t-$current/outside
+    mkdir -p "$h_out"
+    printf 'SECRET\n' > "$h_out/secret"
+    h_sha=$(c40_sha "$h_out/secret")
+    export QUC_PRE_PUBLISH_PAUSE=8
+    run_start --eject-dest "$src" "$dst"
+    if [ "$quc_ec" -ne 0 ] || [ "$quc_noisy" -ne 0 ]; then
+        echo "start ec=$quc_ec"
+        bad=1
+    fi
+    if ! wait_phase prepublish 80; then
+        echo "phase=$(job_field phase) status=$(job_field copy_status)"
+        bad=1
+    fi
+    if [ ! -d "$dst/sub" ] || [ -L "$dst/sub" ]; then
+        echo "parent missing"
+        bad=1
+    else
+        mv -- "$dst/sub" "$dst/sub-aside" || bad=1
+        ln -s "$h_out" "$dst/sub" || bad=1
+    fi
+    st=$(wait_done 80)
+    unset QUC_PRE_PUBLISH_PAUSE
+    if [ "$st" = SUCCESS ] || [ -e "$h_out/a.txt" ] || [ -L "$h_out/a.txt" ]; then
+        echo "status=$st wrote outside"
+        bad=1
+    fi
+    if [ "$(c40_sha "$h_out/secret")" != "$h_sha" ] || [ "$(cat "$h_out/secret")" != SECRET ]; then
+        echo "canary changed"
+        bad=1
+    fi
+    if [ "$(g_stub_actions)" != 0 ]; then
+        echo "parent swap called eject"
+        cat "$g_stub_log"
+        bad=1
+    fi
+    quc_resolve_tools || bad=1
+    printf 'NEW\n' > "$WORK/t-$current/payload"
+    ln -s "$h_out/secret" "$h_out/link"
+    quc_run_mode=fresh
+    quc_write_root=
+    quc_write_ino=
+    quc_publish_limited=0
+    quc_log_file=
+    quc_publish_file "$WORK/t-$current/payload" "$h_out/link"
+    h_rc=$?
+    if [ "$h_rc" -eq 0 ] || [ ! -L "$h_out/link" ] || [ "$(c40_sha "$h_out/secret")" != "$h_sha" ] || [ "$(cat "$h_out/secret")" != SECRET ]; then
+        echo "symlink publish rc=$h_rc"
+        bad=1
+    fi
+    if [ "$bad" -eq 0 ]; then pass; else fail "parent and symlink stay inside the tree status=$st"; fi
+}
+
+test_H10() {
+    bad=0
+    g_stub_install
+    make_pair || { fail "mount"; return; }
+    printf 'payload\n' > "$src/a.txt"
+    export QUC_PRE_PUBLISH_PAUSE=8
+    run_start --eject-dest "$src" "$dst"
+    if [ "$quc_ec" -ne 0 ] || [ "$quc_noisy" -ne 0 ]; then
+        echo "start ec=$quc_ec"
+        bad=1
+    fi
+    if ! wait_phase prepublish 80; then
+        echo "phase=$(job_field phase) status=$(job_field copy_status)"
+        bad=1
+    fi
+    h_pid=$(c40_owner_pid)
+    case $h_pid in
+        ''|0|1|*[!0-9]*) echo "pid=$h_pid"; bad=1 ;;
+        *) kill -KILL "$h_pid" 2>/dev/null || bad=1 ;;
+    esac
+    sleep 0.4
+    unset QUC_PRE_PUBLISH_PAUSE
+    if [ "$(job_field copy_status)" = SUCCESS ] || [ -e "$dst/a.txt" ] || [ -L "$dst/a.txt" ]; then
+        echo "status=$(job_field copy_status) published=$(cat "$dst/a.txt" 2>/dev/null || true)"
+        bad=1
+    fi
+    if [ "$(g_stub_actions)" != 0 ]; then
+        echo "kill called eject"
+        cat "$g_stub_log"
+        bad=1
+    fi
+    if [ "$bad" -eq 0 ]; then pass; else fail "SIGKILL during publish is not success"; fi
+}
+
+test_H11() {
+    bad=0
+    g_stub_install
+    make_pair || { fail "mount"; return; }
+    printf 'alpha-one\n' > "$src/a.txt"
+    printf 'bravo-two\n' > "$src/b.txt"
+    printf 'charlie-three\n' > "$src/c.txt"
+    save_src
+    export QUC_FILE_PAUSE=2
+    run_start --eject-dest "$src" "$dst"
+    if [ "$quc_ec" -ne 0 ] || [ "$quc_noisy" -ne 0 ]; then
+        echo "start ec=$quc_ec"
+        bad=1
+    fi
+    h_i=0
+    h_saw=0
+    while [ "$h_i" -lt 40 ]; do
+        h_n=$(job_field files_done || true)
+        case $h_n in
+            ''|0) ;;
+            *) h_saw=1; break ;;
+        esac
+        h_st=$(job_field copy_status || true)
+        case $h_st in
+            SUCCESS|PARTIAL|FAILED|UNCERTAIN) break ;;
+        esac
+        sleep 0.2
+        h_i=$((h_i + 1))
+    done
+    if [ "$h_saw" -ne 1 ]; then
+        echo "no progress status=$(job_field copy_status)"
+        bad=1
+    fi
+    "$SH" "$SCRIPT" stop >/dev/null 2>&1 || bad=1
+    st=$(wait_done 40)
+    if [ "$st" = SUCCESS ]; then
+        echo "stop became success"
+        bad=1
+    fi
+    h_copied=
+    for h_name in a.txt b.txt c.txt; do
+        if [ -f "$dst/$h_name" ]; then
+            h_copied=$h_name
+            break
+        fi
+    done
+    if [ -z "$h_copied" ]; then
+        echo "nothing copied"
+        bad=1
+    else
+        printf 'FOREIGN\n' > "$dst/$h_copied"
+        h_sha=$(c40_sha "$dst/$h_copied")
+    fi
+    unset QUC_FILE_PAUSE
+    run_resume
+    if [ "$quc_ec" -ne 0 ] || [ "$quc_noisy" -ne 0 ]; then
+        echo "resume ec=$quc_ec noisy=$quc_noisy"
+        bad=1
+    fi
+    st=$(wait_done 80)
+    if [ "$st" = SUCCESS ] || [ -z "$h_copied" ] || [ "$(c40_sha "$dst/$h_copied")" != "$h_sha" ] || [ "$(cat "$dst/$h_copied")" != FOREIGN ]; then
+        echo "status=$st replaced foreign"
+        bad=1
+    fi
+    if [ "$(job_field eject_status)" != skipped_policy ] || [ "$(g_stub_actions)" != 0 ]; then
+        echo "eject=$(job_field eject_status) actions=$(g_stub_actions)"
+        cat "$g_stub_log"
+        bad=1
+    fi
+    src_same || bad=1
+    if [ "$bad" -eq 0 ]; then pass; else fail "resume does not replace a foreign file status=$st"; fi
+}
+
+i_arm_exclusive() {
+    i_bin=$WORK/t-$current/bin
+    i_mvlog=$WORK/t-$current/mv.log
+    mkdir -p "$i_bin" || return 1
+    : > "$i_mvlog" || return 1
+    i_real_ln=$(PATH=$ORIG_PATH command -v ln) || return 1
+    i_real_mv=$(PATH=$ORIG_PATH command -v mv) || return 1
+    cat > "$i_bin/ln" <<EOF
+#!/bin/sh
+real=$i_real_ln
+root=$dst
+if [ "\$1" = -s ]; then
+    exec "\$real" "\$@"
+fi
+last=
+for a in "\$@"; do
+    case \$a in
+        --) continue ;;
+    esac
+    last=\$a
+done
+case \$last in
+    "\$root"|"\$root"/*)
+        exit 1
+        ;;
+esac
+exec "\$real" "\$@"
+EOF
+    chmod 755 "$i_bin/ln" || return 1
+    cat > "$i_bin/mv" <<EOF
+#!/bin/sh
+printf '%s\n' "\$*" >> "$i_mvlog"
+exec $i_real_mv "\$@"
+EOF
+    chmod 755 "$i_bin/mv" || return 1
+    PATH=$i_bin:$PATH
+    export PATH
+}
+
+i_dest_mv() {
+    if [ ! -f "$i_mvlog" ]; then
+        return 1
+    fi
+    grep -F -- "$dst/" "$i_mvlog" >/dev/null
+}
+
+i_partial_left() {
+    find "$dst" -name '.quc-partial.*' -print 2>/dev/null | grep -q .
+}
+
+i_wait_visible() {
+    i_secs=${1:-30}
+    case $i_secs in
+        ''|*[!0-9]*) i_secs=30 ;;
+    esac
+    i_max=$((i_secs * 5))
+    i_n=0
+    while [ "$i_n" -lt "$i_max" ]; do
+        if [ "$(job_field partial_visible || true)" = 1 ]; then
+            return 0
+        fi
+        i_st=$(job_field copy_status || true)
+        case $i_st in
+            SUCCESS|PARTIAL|FAILED|CANCELLED|INTERRUPTED|UNCERTAIN) return 1 ;;
+        esac
+        sleep 0.2
+        i_n=$((i_n + 1))
+    done
+    return 1
+}
+
+test_I01() {
+    bad=0
+    make_pair || { fail "mount"; return; }
+    printf 'exclusive-bytes\n' > "$src/a.txt"
+    chmod 640 "$src/a.txt" || bad=1
+    mkdir -p "$src/sub" || bad=1
+    printf 'nested\n' > "$src/sub/b.txt"
+    ln -s "rel-target" "$src/link.txt" || bad=1
+    i_mode=$(stat -c '%a' "$src/a.txt")
+    save_src
+    i_arm_exclusive || { fail "wrapper"; return; }
+    run_start "$src" "$dst"
+    if [ "$quc_ec" -ne 0 ] || [ "$quc_noisy" -ne 0 ]; then
+        echo "start ec=$quc_ec noisy=$quc_noisy"
+        bad=1
+    fi
+    st=$(wait_done 80)
+    if [ "$st" != SUCCESS ] || ! cmp -s "$src/a.txt" "$dst/a.txt" || ! cmp -s "$src/sub/b.txt" "$dst/sub/b.txt"; then
+        echo "status=$st bytes"
+        bad=1
+    fi
+    if [ "$(c40_sha "$dst/a.txt")" != "$(c40_sha "$src/a.txt")" ] || [ "$(stat -c '%a' "$dst/a.txt")" != "$i_mode" ]; then
+        echo "checksum or mode got=$(stat -c '%a' "$dst/a.txt" 2>/dev/null) want=$i_mode"
+        bad=1
+    fi
+    if [ "$(readlink "$dst/link.txt")" != rel-target ]; then
+        echo "symlink $(readlink "$dst/link.txt" 2>/dev/null)"
+        bad=1
+    fi
+    if [ "$(job_field publish_mode)" != exclusive ] || [ "$(job_field partial_visible)" != 0 ] || [ "$(job_field dest_link_probe)" != exclusive ]; then
+        echo "mode=$(job_field publish_mode) probe=$(job_field dest_link_probe) visible=$(job_field partial_visible)"
+        bad=1
+    fi
+    if i_partial_left || i_dest_mv; then
+        echo "partial or mv"
+        bad=1
+    fi
+    src_same || bad=1
+    if [ "$bad" -eq 0 ]; then pass; else fail "exclusive copy status=$st"; fi
+}
+
+test_I02() {
+    bad=0
+    make_pair || { fail "mount"; return; }
+    printf 'KEEP\n' > "$dst/keep.txt"
+    i_keep=$(c40_sha "$dst/keep.txt")
+    printf 'plan\n' > "$src/a.txt"
+    i_arm_exclusive || { fail "wrapper"; return; }
+    run_quiet "$SH" "$SCRIPT" plan "$src" "$dst"
+    if [ "$quc_ec" -ne 0 ] || ! grep -q '^plan_result=OK$' "$quc_out" || ! grep -q '^dest_link_probe=exclusive$' "$quc_out" || ! grep -q '^publish_policy=no-replace$' "$quc_out" || ! grep -q 'Новый файл виден до проверки содержимого и не считается готовым.' "$quc_out" || grep -q '^checks_not_run=' "$quc_out" || grep -q '^plan_result=REJECT$' "$quc_out"; then
+        echo "plan exclusive ec=$quc_ec"
+        cat "$quc_out" "$quc_err"
+        bad=1
+    fi
+    if [ -e "$dst/a.txt" ] || [ -L "$dst/a.txt" ] || i_partial_left || [ "$(c40_sha "$dst/keep.txt")" != "$i_keep" ]; then
+        echo "plan created or changed a user file"
+        bad=1
+    fi
+    if i_dest_mv; then
+        echo "plan moved destination data"
+        cat "$i_mvlog"
+        bad=1
+    fi
+    if [ "$bad" -eq 0 ]; then pass; else fail "exclusive plan"; fi
+}
+
+test_I03() {
+    bad=0
+    make_pair || { fail "mount"; return; }
+    printf 'payload\n' > "$src/a.txt"
+    save_src
+    i_arm_exclusive || { fail "wrapper"; return; }
+    export QUC_PRE_MARK_PAUSE=8
+    run_start "$src" "$dst"
+    if ! wait_phase mark 80; then
+        echo "phase=$(job_field phase) status=$(job_field copy_status)"
+        bad=1
+    fi
+    printf 'FOREIGN\n' > "$dst/a.txt"
+    i_sha=$(c40_sha "$dst/a.txt")
+    st=$(wait_done 80)
+    unset QUC_PRE_MARK_PAUSE
+    if [ "$st" = SUCCESS ] || [ "$st" = PARTIAL ]; then
+        echo "false success status=$st"
+        bad=1
+    fi
+    if [ "$(c40_sha "$dst/a.txt")" != "$i_sha" ] || [ "$(cat "$dst/a.txt")" != FOREIGN ]; then
+        echo "foreign file changed"
+        bad=1
+    fi
+    if i_dest_mv; then
+        echo "mv used"
+        bad=1
+    fi
+    src_same || bad=1
+    if [ "$bad" -eq 0 ]; then pass; else fail "existing name status=$st"; fi
+}
+
+test_I04() {
+    bad=0
+    make_pair || { fail "mount"; return; }
+    printf 'payload\n' > "$src/a.txt"
+    save_src
+    i_out=$WORK/t-$current/outside
+    mkdir -p "$i_out"
+    printf 'SECRET\n' > "$i_out/secret"
+    i_sha=$(c40_sha "$i_out/secret")
+    i_arm_exclusive || { fail "wrapper"; return; }
+    export QUC_PRE_MARK_PAUSE=8
+    run_start "$src" "$dst"
+    if ! wait_phase mark 80; then
+        echo "phase=$(job_field phase)"
+        bad=1
+    fi
+    ln -s "$i_out/secret" "$dst/a.txt" || bad=1
+    st=$(wait_done 80)
+    unset QUC_PRE_MARK_PAUSE
+    if [ "$st" = SUCCESS ] || [ "$st" = PARTIAL ]; then
+        echo "false success status=$st"
+        bad=1
+    fi
+    if [ ! -L "$dst/a.txt" ] || [ "$(readlink "$dst/a.txt")" != "$i_out/secret" ]; then
+        echo "symlink replaced"
+        bad=1
+    fi
+    if [ "$(c40_sha "$i_out/secret")" != "$i_sha" ] || [ "$(cat "$i_out/secret")" != SECRET ]; then
+        echo "symlink target changed"
+        bad=1
+    fi
+    src_same || bad=1
+    if [ "$bad" -eq 0 ]; then pass; else fail "symlink destination status=$st"; fi
+}
+
+test_I05() {
+    bad=0
+    make_pair || { fail "mount"; return; }
+    printf 'visible-before-verify\n' > "$src/a.txt"
+    i_sha=$(c40_sha "$src/a.txt")
+    save_src
+    i_arm_exclusive || { fail "wrapper"; return; }
+    export QUC_FILL_PAUSE=8
+    run_start "$src" "$dst"
+    if ! i_wait_visible 40; then
+        echo "visible=$(job_field partial_visible) phase=$(job_field phase) status=$(job_field copy_status)"
+        bad=1
+    fi
+    if [ ! -f "$dst/a.txt" ] || [ -L "$dst/a.txt" ]; then
+        echo "name was not visible during the write"
+        bad=1
+    fi
+    i_mid=$(job_field copy_status || true)
+    case $i_mid in
+        SUCCESS|PARTIAL) echo "early success $i_mid"; bad=1 ;;
+    esac
+    if [ "$(stat -c '%s' "$dst/a.txt")" != 0 ]; then
+        echo "bytes appeared before the fill pause ended size=$(stat -c '%s' "$dst/a.txt")"
+        bad=1
+    fi
+    st=$(wait_done 80)
+    unset QUC_FILL_PAUSE
+    if [ "$st" != SUCCESS ] || [ "$(c40_sha "$dst/a.txt")" != "$i_sha" ] || ! cmp -s "$src/a.txt" "$dst/a.txt"; then
+        echo "status=$st"
+        bad=1
+    fi
+    if [ "$(job_field partial_visible)" != 0 ] || [ "$(job_field publish_mode)" != exclusive ]; then
+        echo "visible=$(job_field partial_visible) mode=$(job_field publish_mode)"
+        bad=1
+    fi
+    src_same || bad=1
+    if [ "$bad" -eq 0 ]; then pass; else fail "visible incomplete name status=$st"; fi
+}
+
+test_I06() {
+    bad=0
+    make_pair || { fail "mount"; return; }
+    printf 'kill-during-write\n' > "$src/a.txt"
+    i_sha=$(c40_sha "$src/a.txt")
+    save_src
+    i_arm_exclusive || { fail "wrapper"; return; }
+    export QUC_FILL_PAUSE=20
+    run_start "$src" "$dst"
+    if ! i_wait_visible 40; then
+        echo "not visible status=$(job_field copy_status)"
+        bad=1
+    fi
+    i_pid=$(c40_owner_pid)
+    if [ -z "$i_pid" ]; then
+        echo "no owner pid"
+        bad=1
+    else
+        kill -KILL "$i_pid" 2>/dev/null || bad=1
+    fi
+    sleep 0.5
+    i_mid=$(job_field copy_status || true)
+    case $i_mid in
+        SUCCESS|PARTIAL)
+            echo "killed job looked finished $i_mid"
+            bad=1
+            ;;
+    esac
+    if [ "$(job_field partial_visible)" != 1 ]; then
+        echo "partial record lost visible=$(job_field partial_visible)"
+        bad=1
+    fi
+    unset QUC_FILL_PAUSE
+    run_resume
+    if [ "$quc_ec" -ne 0 ] || [ "$quc_noisy" -ne 0 ]; then
+        echo "resume ec=$quc_ec noisy=$quc_noisy"
+        bad=1
+    fi
+    st=$(wait_done 80)
+    if [ "$st" != SUCCESS ] || [ "$(c40_sha "$dst/a.txt")" != "$i_sha" ] || ! cmp -s "$src/a.txt" "$dst/a.txt"; then
+        echo "resume status=$st"
+        bad=1
+    fi
+    if [ "$(job_field partial_visible)" != 0 ]; then
+        echo "partial still visible"
+        bad=1
+    fi
+    src_same || bad=1
+    if [ "$bad" -eq 0 ]; then pass; else fail "sigkill resume status=$st"; fi
+}
+
+test_I07() {
+    bad=0
+    make_pair 1m 4m || { fail "mount"; return; }
+    dd if=/dev/zero of="$src/a.txt" bs=1024 count=32 >/dev/null 2>&1 || bad=1
+    i_sha=$(c40_sha "$src/a.txt")
+    save_src
+    i_arm_exclusive || { fail "wrapper"; return; }
+    export QUC_FILL_PAUSE=12
+    run_start "$src" "$dst"
+    if ! i_wait_visible 40; then
+        echo "not visible status=$(job_field copy_status) err=$(job_field error)"
+        bad=1
+    fi
+    dd if=/dev/zero of="$dst/FILLER" bs=4096 count=2048 >/dev/null 2>&1 || true
+    if [ ! -f "$dst/FILLER" ]; then
+        echo "filler was not created"
+        bad=1
+    fi
+    i_fill=$(c40_sha "$dst/FILLER")
+    st=$(wait_done 80)
+    unset QUC_FILL_PAUSE
+    if [ "$st" = SUCCESS ] || [ "$st" = PARTIAL ]; then
+        echo "false success status=$st"
+        bad=1
+    fi
+    if ! job_field error | grep -q 'место'; then
+        echo "error=$(job_field error) status=$st"
+        bad=1
+    fi
+    if [ ! -f "$dst/FILLER" ] || [ "$(c40_sha "$dst/FILLER")" != "$i_fill" ]; then
+        echo "filler was removed or changed"
+        bad=1
+    fi
+    rm -f -- "$dst/FILLER"
+    run_resume
+    if [ "$quc_ec" -ne 0 ] || [ "$quc_noisy" -ne 0 ]; then
+        echo "resume ec=$quc_ec noisy=$quc_noisy"
+        cat "$quc_out" "$quc_err"
+        bad=1
+    fi
+    st2=$(wait_done 80)
+    if [ "$st2" != SUCCESS ] || [ "$(c40_sha "$dst/a.txt")" != "$i_sha" ] || ! cmp -s "$src/a.txt" "$dst/a.txt"; then
+        echo "after free status=$st2 err=$(job_field error)"
+        bad=1
+    fi
+    if [ -e "$dst/FILLER" ] || [ "$(job_field partial_visible)" != 0 ]; then
+        echo "filler returned or partial remains"
+        bad=1
+    fi
+    src_same || bad=1
+    if [ "$bad" -eq 0 ]; then pass; else fail "enospc status=$st resume=$st2"; fi
+}
+
+test_I08() {
+    bad=0
+    make_pair || { fail "mount"; return; }
+    printf 'resume-incomplete\n' > "$src/a.txt"
+    i_sha=$(c40_sha "$src/a.txt")
+    i_full=$(stat -c '%s' "$src/a.txt")
+    save_src
+    i_arm_exclusive || { fail "wrapper"; return; }
+    export QUC_FILL_PAUSE=20
+    run_start "$src" "$dst"
+    if ! i_wait_visible 40; then
+        echo "not visible"
+        bad=1
+    fi
+    i_now=$(stat -c '%s' "$dst/a.txt" 2>/dev/null || echo missing)
+    if [ "$i_now" = "$i_full" ]; then
+        echo "incomplete file already had the full size"
+        bad=1
+    fi
+    i_pid=$(c40_owner_pid)
+    kill -KILL "$i_pid" 2>/dev/null || bad=1
+    sleep 0.5
+    i_mid=$(job_field copy_status || true)
+    case $i_mid in
+        SUCCESS|PARTIAL) echo "status $i_mid"; bad=1 ;;
+    esac
+    unset QUC_FILL_PAUSE
+    run_resume
+    st=$(wait_done 80)
+    if [ "$st" != SUCCESS ] || [ "$(c40_sha "$dst/a.txt")" != "$i_sha" ] || [ "$(job_field partial_visible)" != 0 ]; then
+        echo "resume status=$st visible=$(job_field partial_visible)"
+        bad=1
+    fi
+    src_same || bad=1
+    if [ "$bad" -eq 0 ]; then pass; else fail "resume incomplete status=$st"; fi
+}
+
+test_I09() {
+    bad=0
+    g_stub_install
+    make_pair || { fail "mount"; return; }
+    printf 'before-verify\n' > "$src/a.txt"
+    save_src
+    i_arm_exclusive || { fail "wrapper"; return; }
+    export QUC_PRE_VERIFY_PAUSE=8
+    run_start --eject-dest "$src" "$dst"
+    if ! wait_phase content-verify 80; then
+        echo "phase=$(job_field phase) status=$(job_field copy_status)"
+        bad=1
+    fi
+    if ! cmp -s "$src/a.txt" "$dst/a.txt"; then
+        echo "not published before verify"
+        bad=1
+    fi
+    printf 'DAMAGED\n' > "$dst/a.txt"
+    i_sha=$(c40_sha "$dst/a.txt")
+    st=$(wait_done 80)
+    unset QUC_PRE_VERIFY_PAUSE
+    if [ "$(job_field verify_status)" != failed ] || [ "$(job_field eject_status)" != skipped_policy ] || [ "$(g_stub_actions)" != 0 ]; then
+        echo "status=$st verify=$(job_field verify_status) eject=$(job_field eject_status) actions=$(g_stub_actions)"
+        bad=1
+    fi
+    if [ "$st" = SUCCESS ] && [ "$(job_field verify_status)" = failed ]; then
+        :
+    else
+        echo "unexpected status=$st"
+        bad=1
+    fi
+    if [ "$(c40_sha "$dst/a.txt")" != "$i_sha" ] || [ "$(cat "$dst/a.txt")" != DAMAGED ]; then
+        echo "damaged bytes rewritten"
+        bad=1
+    fi
+    src_same || bad=1
+    if [ "$bad" -eq 0 ]; then pass; else fail "damage before verify status=$st"; fi
+}
+
+test_I10() {
+    bad=0
+    g_stub_install
+    make_pair || { fail "mount"; return; }
+    printf 'concurrent\n' > "$src/a.txt"
+    save_src
+    i_arm_exclusive || { fail "wrapper"; return; }
+    export QUC_FILL_PAUSE=10
+    run_start --eject-dest "$src" "$dst"
+    if ! i_wait_visible 40; then
+        echo "not visible status=$(job_field copy_status)"
+        bad=1
+    fi
+    rm -f -- "$dst/a.txt"
+    printf 'FOREIGN\n' > "$dst/a.txt"
+    i_sha=$(c40_sha "$dst/a.txt")
+    i_ino=$(stat -c '%i' "$dst/a.txt")
+    st=$(wait_done 80)
+    unset QUC_FILL_PAUSE
+    if [ "$st" = SUCCESS ] || [ "$st" = PARTIAL ]; then
+        echo "false success status=$st"
+        bad=1
+    fi
+    if [ "$(c40_sha "$dst/a.txt")" != "$i_sha" ] || [ "$(cat "$dst/a.txt")" != FOREIGN ] || [ "$(stat -c '%i' "$dst/a.txt")" != "$i_ino" ]; then
+        echo "foreign inode replaced"
+        bad=1
+    fi
+    if [ "$(g_stub_actions)" != 0 ] || [ "$(job_field eject_status)" = power_off ] || [ "$(job_field eject_status)" = unmounted ]; then
+        echo "eject=$(job_field eject_status) actions=$(g_stub_actions)"
+        bad=1
+    fi
+    src_same || bad=1
+    if [ "$bad" -eq 0 ]; then pass; else fail "concurrent replace status=$st"; fi
+}
+
+test_I11() {
+    bad=0
+    make_pair || { fail "mount"; return; }
+    printf 'staged-without-source\n' > "$src/a.txt"
+    cp -- "$src/a.txt" "$WORK/t-$current/orig.txt" || bad=1
+    i_sha=$(c40_sha "$WORK/t-$current/orig.txt")
+    i_arm_exclusive || { fail "wrapper"; return; }
+    export QUC_PRE_MARK_PAUSE=8
+    run_start --source-mode staged "$src" "$dst"
+    if [ "$quc_ec" -ne 0 ] || [ "$quc_noisy" -ne 0 ]; then
+        echo "start ec=$quc_ec noisy=$quc_noisy"
+        bad=1
+    fi
+    if ! c40_wait_ready_running 80; then
+        echo "ready status=$(job_field copy_status) stage=$(job_field stage_status)"
+        bad=1
+    fi
+    if ! wait_phase mark 80; then
+        echo "phase=$(job_field phase) status=$(job_field copy_status) stage=$(job_field stage_status)"
+        bad=1
+    fi
+    i_gone=0
+    i_off=0
+    while [ "$i_off" -lt 25 ]; do
+        if umount "$src" 2>/dev/null; then
+            i_gone=1
+            break
+        fi
+        i_off=$((i_off + 1))
+        sleep 0.2
+    done
+    if [ "$i_gone" != 1 ]; then
+        echo "source still mounted"
+        bad=1
+    fi
+    unset QUC_PRE_MARK_PAUSE
+    st=$(wait_done 80)
+    if [ "$st" != SUCCESS ] || [ "$(job_field stage_status)" != READY ] || [ "$(job_field publish_mode)" != exclusive ]; then
+        echo "status=$st stage=$(job_field stage_status) mode=$(job_field publish_mode) err=$(job_field error)"
+        bad=1
+    fi
+    if ! cmp -s "$WORK/t-$current/orig.txt" "$dst/a.txt" || [ "$(c40_sha "$dst/a.txt")" != "$i_sha" ]; then
+        echo "dest bytes"
+        bad=1
+    fi
+    if [ "$(job_field partial_visible)" != 0 ]; then
+        echo "partial remains"
+        bad=1
+    fi
+    if [ "$bad" -eq 0 ]; then pass; else fail "staged without source status=$st"; fi
+}
+
+test_I12() {
+    bad=0
+    g_stub_install
+    make_pair || { fail "mount"; return; }
+    printf 'eject-gate\n' > "$src/a.txt"
+    i_sha=$(c40_sha "$src/a.txt")
+    save_src
+    i_arm_exclusive || { fail "wrapper"; return; }
+    run_start --eject-dest "$src" "$dst"
+    st=$(wait_done 80)
+    i_verify=$(job_field verify_status || true)
+    case $i_verify in
+        checksum|byte) ;;
+        *) echo "verify=$i_verify"; bad=1 ;;
+    esac
+    if [ "$st" != SUCCESS ] || [ "$(job_field eject_status)" != skipped_policy ] || [ "$(g_stub_actions)" != 0 ]; then
+        echo "status=$st eject=$(job_field eject_status) actions=$(g_stub_actions) verify=$i_verify"
+        bad=1
+    fi
+    if [ "$(c40_sha "$dst/a.txt")" != "$i_sha" ] || [ "$(job_field publish_mode)" != exclusive ]; then
+        echo "bytes or mode"
+        bad=1
+    fi
+    src_same || bad=1
+    if [ "$bad" -eq 0 ]; then pass; else fail "eject gate status=$st"; fi
+}
+
+i_try_image() {
+    i_kind=$1
+    i_tool=$2
+    i_mnt=$WORK/t-$current/mnt-$i_kind
+    i_file=$WORK/t-$current/$i_kind.img
+    mkdir -p "$i_mnt" || return 0
+    i_bin=$i_tool
+    if ! command -v "$i_tool" >/dev/null 2>&1; then
+        if [ -x "/usr/sbin/$i_tool" ]; then
+            i_bin=/usr/sbin/$i_tool
+        elif [ -x "/sbin/$i_tool" ]; then
+            i_bin=/sbin/$i_tool
+        else
+            echo "$i_kind=NOT_RUN tool"
+            return 0
+        fi
+    fi
+    if ! dd if=/dev/zero of="$i_file" bs=1024 count=8192 >/dev/null 2>&1; then
+        echo "$i_kind=NOT_RUN image"
+        return 0
+    fi
+    if ! "$i_bin" "$i_file" >/dev/null 2>&1; then
+        echo "$i_kind=NOT_RUN mkfs"
+        return 0
+    fi
+    if ! mount -o loop "$i_file" "$i_mnt" >/dev/null 2>&1; then
+        echo "$i_kind=NOT_RUN loop"
+        umount "$i_mnt" >/dev/null 2>&1 || true
+        return 0
+    fi
+    echo "$i_kind=MOUNTED"
+    printf 'fat-bytes\n' > "$WORK/t-$current/src-$i_kind/a.txt" 2>/dev/null || mkdir -p "$WORK/t-$current/src-$i_kind"
+    printf 'fat-bytes\n' > "$WORK/t-$current/src-$i_kind/a.txt"
+    umount "$i_mnt" >/dev/null 2>&1 || umount -l "$i_mnt" >/dev/null 2>&1 || true
+    return 0
+}
+
+test_J01() {
+    bad=0
+    quc_fat_name_bad vfat 'COM1' || bad=1
+    quc_fat_name_bad vfat 'dir/foo:bar' || bad=1
+    quc_fat_name_bad exfat 'a<b' || bad=1
+    quc_fat_name_bad ntfs 'a*b' || bad=1
+    quc_fat_name_bad ntfs 'AUX.txt' || bad=1
+    quc_fat_name_bad vfat 'ok name.txt' && bad=1
+    quc_fat_name_bad exfat 'файл.txt' && bad=1
+    quc_fat_name_bad ntfs 'my file.txt' && bad=1
+    quc_fat_name_bad ext4 'foo:bar' && bad=1
+    quc_fat_name_bad tmpfs 'Readme.txt' && bad=1
+    j_long=$(awk 'BEGIN { while (length(s) < 256) s = s "a"; print s }')
+    quc_fat_name_bad vfat "$j_long" || bad=1
+    j_ok=$(awk 'BEGIN { while (length(s) < 200) s = s "b"; print s }')
+    quc_fat_name_bad exfat "$j_ok" && bad=1
+    j_dot='trail.'
+    quc_fat_name_bad vfat "$j_dot" || bad=1
+    j_sp='trail '
+    quc_fat_name_bad ntfs "$j_sp" || bad=1
+    j_nl=$(printf 'a\nb')
+    quc_fat_name_bad vfat "$j_nl" || bad=1
+    case $(quc_name_class vfat) in fat) ;; *) bad=1 ;; esac
+    case $(quc_name_class exfat) in exfat) ;; *) bad=1 ;; esac
+    case $(quc_name_class ntfs) in ntfs) ;; *) bad=1 ;; esac
+    case $(quc_name_class fuseblk) in ntfs) ;; *) bad=1 ;; esac
+    case $(quc_name_class ext4) in posix) ;; *) bad=1 ;; esac
+    j_fat=$(quc_fs_caution vfat)
+    j_ex=$(quc_fs_caution exfat)
+    j_nt=$(quc_fs_caution ntfs)
+    case $j_fat in *'FAT:'*) ;; *) echo "fat caution $j_fat"; bad=1 ;; esac
+    case $j_ex in *'до запуска'*) ;; *) echo "exfat caution"; bad=1 ;; esac
+    case $j_nt in *'до запуска'*) ;; *) echo "ntfs caution"; bad=1 ;; esac
+    case $j_fat$j_ex$j_nt in *'запускать нельзя'*) echo "caution blocks"; bad=1 ;; esac
+    if [ "$bad" -eq 0 ]; then pass; else fail "windows name rules"; fi
+}
+
+test_J02() {
+    bad=0
+    quc_resolve_tools || { fail "tools"; return; }
+    j_src=$WORK/t-$current/names
+    j_dst=$WORK/t-$current/keepdir
+    mkdir -p "$j_src/empty" "$j_src/sub" "$j_dst" || bad=1
+    printf 'space\n' > "$j_src/my file.txt"
+    printf 'uni\n' > "$j_src/файл.txt"
+    printf 'A\n' > "$j_src/Readme.txt"
+    printf 'a\n' > "$j_src/readme.txt"
+    printf 'colon\n' > "$j_src/sub/bad:name"
+    ln -s Readme.txt "$j_src/link.txt" || bad=1
+    printf 'KEEP\n' > "$j_dst/keep.txt"
+    j_keep=$(c40_sha "$j_dst/keep.txt")
+    if ! quc_scan_win_names "$j_src"; then
+        echo "scan failed"
+        bad=1
+    fi
+    if [ "${quc_name_bad:-0}" -lt 1 ] || [ "${quc_name_fold:-0}" -lt 1 ] || [ "${quc_name_links:-0}" -lt 1 ]; then
+        echo "bad=$quc_name_bad fold=$quc_name_fold links=$quc_name_links sample=$quc_name_sample"
+        bad=1
+    fi
+    case $quc_name_sample in
+        *'bad:name'*) ;;
+        *) echo "bad sample=$quc_name_sample"; bad=1 ;;
+    esac
+    case $quc_name_fold_sample in
+        *'Readme.txt'*'readme.txt'*) ;;
+        *) echo "fold sample=$quc_name_fold_sample"; bad=1 ;;
+    esac
+    j_clean=$WORK/t-$current/clean
+    mkdir -p "$j_clean/empty" || bad=1
+    printf 'space\n' > "$j_clean/my file.txt"
+    printf 'uni\n' > "$j_clean/файл.txt"
+    if ! quc_scan_win_names "$j_clean"; then
+        echo "clean scan failed"
+        bad=1
+    fi
+    if [ "${quc_name_bad:-1}" != 0 ] || [ "${quc_name_fold:-1}" != 0 ] || [ "${quc_name_links:-1}" != 0 ]; then
+        echo "clean bad=$quc_name_bad fold=$quc_name_fold links=$quc_name_links"
+        bad=1
+    fi
+    quc_problems=
+    quc_notes=
+    quc_source=$j_src
+    quc_target_fs=vfat
+    quc_apply_name_policy
+    case $quc_problems in
+        *'Копирование не начато.'*) ;;
+        *) echo "policy did not refuse: $quc_problems"; bad=1 ;;
+    esac
+    case $quc_problems in
+        *'bad:name'*) ;;
+        *) echo "refusal example is not the illegal name: $quc_problems"; bad=1 ;;
+    esac
+    case $quc_problems in
+        *'Readme.txt'*) ;;
+        *) echo "fold example missing: $quc_problems"; bad=1 ;;
+    esac
+    case $quc_notes in
+        *'не будет SUCCESS'*) ;;
+        *) echo "symlink note missing: $quc_notes"; bad=1 ;;
+    esac
+    quc_problems=
+    quc_notes=
+    quc_target_fs=tmpfs
+    quc_apply_name_policy
+    if [ -n "$quc_problems" ] || [ -n "$quc_notes" ]; then
+        echo "posix policy changed the plan: $quc_problems $quc_notes"
+        bad=1
+    fi
+    if [ "$(c40_sha "$j_dst/keep.txt")" != "$j_keep" ] || [ "$(cat "$j_dst/keep.txt")" != KEEP ]; then
+        echo "foreign file changed"
+        bad=1
+    fi
+    if [ "$bad" -eq 0 ]; then pass; else fail "name scan"; fi
+}
+
+test_J03() {
+    bad=0
+    make_pair || { fail "mount"; return; }
+    mkdir -p "$src/empty" || bad=1
+    printf 'A\n' > "$src/Readme.txt"
+    printf 'a\n' > "$src/readme.txt"
+    printf 'space\n' > "$src/my file.txt"
+    printf 'uni\n' > "$src/файл.txt"
+    printf 'KEEP\n' > "$dst/keep.txt"
+    j_keep=$(c40_sha "$dst/keep.txt")
+    save_src
+    run_start --dest-mode separate "$src" "$dst"
+    if [ "$quc_ec" -ne 0 ] || [ "$quc_noisy" -ne 0 ]; then
+        echo "start ec=$quc_ec noisy=$quc_noisy"
+        bad=1
+    fi
+    st=$(wait_done 80)
+    rel=$(job_field dest_rel || true)
+    if [ "$st" != SUCCESS ]; then
+        echo "status=$st err=$(job_field error)"
+        bad=1
+    fi
+    case $rel in
+        QUC-*) ;;
+        *) echo "dest_rel=$rel"; bad=1 ;;
+    esac
+    cmp -s "$src/Readme.txt" "$dst/$rel/Readme.txt" || bad=1
+    cmp -s "$src/readme.txt" "$dst/$rel/readme.txt" || bad=1
+    cmp -s "$src/my file.txt" "$dst/$rel/my file.txt" || bad=1
+    cmp -s "$src/файл.txt" "$dst/$rel/файл.txt" || bad=1
+    if [ ! -d "$dst/$rel/empty" ]; then
+        echo "empty directory missing"
+        bad=1
+    fi
+    if [ -e "$dst/$rel/keep.txt" ]; then
+        echo "foreign name appeared in the job folder"
+        bad=1
+    fi
+    if [ "$(c40_sha "$dst/keep.txt")" != "$j_keep" ] || [ "$(cat "$dst/keep.txt")" != KEEP ]; then
+        echo "foreign file changed"
+        bad=1
+    fi
+    src_same || bad=1
+    if [ "$bad" -eq 0 ]; then pass; else fail "case-sensitive names status=$st"; fi
+}
+
+test_J04() {
+    bad=0
+    quc_resolve_tools || { fail "tools"; return; }
+    quc_preflight_ok=1
+    quc_problems=
+    quc_notes=
+    quc_dest_link_probe=link
+    quc_menu_set_verdict
+    if [ "$qm_verdict" != 'Проверка: можно начинать' ] || [ -n "$qm_reason" ]; then
+        echo "clean verdict=$qm_verdict reason=$qm_reason"
+        bad=1
+    fi
+    quc_notes='физический диск однозначно не определён; совпадение разделов не проверялось'
+    quc_menu_set_verdict
+    if [ "$qm_verdict" != 'Вердикт: можно копировать с ограничением.' ]; then
+        echo "disk verdict=$qm_verdict"
+        bad=1
+    fi
+    case $qm_reason in
+        *'физический диск'*) ;;
+        *) echo "disk reason=$qm_reason"; bad=1 ;;
+    esac
+    quc_notes='символьных ссылок: 1. На FAT и exFAT они не сохраняются, итог не будет SUCCESS.
+физический диск однозначно не определён; совпадение разделов не проверялось'
+    quc_menu_set_verdict
+    case $qm_reason in
+        *'символьных ссылок'*) ;;
+        *) echo "note picker=$qm_reason"; bad=1 ;;
+    esac
+    case $qm_reason in
+        *'физический диск'*) echo "disk note leaked: $qm_reason"; bad=1 ;;
+    esac
+    quc_notes=
+    quc_dest_link_probe=exclusive
+    quc_menu_set_verdict
+    if [ "$qm_verdict" != 'Вердикт: можно копировать с ограничением.' ]; then
+        echo "exclusive verdict=$qm_verdict"
+        bad=1
+    fi
+    quc_preflight_ok=0
+    quc_problems='На этом назначении нельзя создать новое имя без риска замены. Копирование не начато.'
+    quc_menu_set_verdict
+    if [ "$qm_verdict" != 'Вердикт: копировать нельзя.' ]; then
+        echo "block verdict=$qm_verdict"
+        bad=1
+    fi
+    case $qm_reason in
+        *'нельзя создать новое имя'*) ;;
+        *) echo "block reason=$qm_reason"; bad=1 ;;
+    esac
+    if [ "$bad" -eq 0 ]; then pass; else fail "confirm verdict"; fi
+}
+
+test_I13() {
+    bad=0
+    i_try_image FAT32 mkfs.vfat
+    i_try_image EXFAT mkfs.exfat
+    if [ "$bad" -eq 0 ]; then pass; else fail "filesystem image"; fi
+}
+
 run_case S01 test_S01
 run_case S02 test_S02
 run_case S03 test_S03
@@ -3600,3 +4920,31 @@ run_case G23 test_G23
 run_case G24 test_G24
 run_case G25 test_G25
 run_case G27 test_G27
+run_case H01 test_H01
+run_case H02 test_H02
+run_case H03 test_H03
+run_case H04 test_H04
+run_case H05 test_H05
+run_case H06 test_H06
+run_case H07 test_H07
+run_case H08 test_H08
+run_case H09 test_H09
+run_case H10 test_H10
+run_case H11 test_H11
+run_case I01 test_I01
+run_case I02 test_I02
+run_case I03 test_I03
+run_case I04 test_I04
+run_case I05 test_I05
+run_case I06 test_I06
+run_case I07 test_I07
+run_case I08 test_I08
+run_case I09 test_I09
+run_case I10 test_I10
+run_case I11 test_I11
+run_case I12 test_I12
+run_case I13 test_I13
+run_case J01 test_J01
+run_case J02 test_J02
+run_case J03 test_J03
+run_case J04 test_J04

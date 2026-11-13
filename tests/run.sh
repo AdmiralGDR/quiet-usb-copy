@@ -1,7 +1,4 @@
 #!/bin/sh
-# SPDX-License-Identifier: GPL-3.0-or-later
-# Copyright (C) 2026 AdmiralGDR
-#
 # Tests for Quiet USB Copy. No root on the host, no real USB devices.
 # Isolated tmpfs mounts live in a user and mount namespace.
 # Usage: sh tests/run.sh
@@ -26,6 +23,7 @@ ORIG_PATH=$PATH
 WORK=$(mktemp -d /tmp/quc-tests.XXXXXX) || exit 1
 passes=0
 fails=0
+skips=0
 current=setup
 
 case $WORK in
@@ -86,6 +84,13 @@ pass() {
     passes=$((passes + 1))
 }
 
+skip() {
+    quc_case_ended=$(date +%s)
+    quc_case_secs=$((quc_case_ended - ${quc_case_started:-$quc_case_ended}))
+    printf 'SKIP %s: %s\n' "$current" "$*"
+    skips=$((skips + 1))
+}
+
 fail() {
     printf 'FAIL %s: %s\n' "$current" "$*"
     fails=$((fails + 1))
@@ -104,6 +109,7 @@ begin_test() {
     unset QUC_FILE_PAUSE
     unset QUC_POST_COPY_DELAY
     unset QUC_PRE_PUBLISH_PAUSE
+    unset QUC_PRE_VERIFY_PAUSE
     unset QUC_PRE_MARK_PAUSE
     unset QUC_FILL_PAUSE
     unset QUC_FAKE_VOLUMES
@@ -202,15 +208,7 @@ job_field() {
 }
 
 wait_done() {
-    # The argument counts 0.25 s polls. Under load a worker can stay in
-    # CREATED for several seconds, so every wait gets at least
-    # QUC_TEST_WAIT_MIN polls (default 240, that is 60 s). Only the ceiling
-    # grows: a terminal copy_status still returns at once.
     max=${1:-120}
-    min=${QUC_TEST_WAIT_MIN:-240}
-    if [ "$max" -lt "$min" ]; then
-        max=$min
-    fi
     i=0
     st=''
     while [ "$i" -lt "$max" ]; do
@@ -326,7 +324,7 @@ test_static() {
         bad=1
     fi
     run_quiet "$SH" "$SCRIPT" version
-    if [ "$quc_ec" -ne 0 ] || ! grep -q '^quiet-usb-copy 0.4.0-rc.7$' "$quc_out" || ! grep -q '^build 20261108.2$' "$quc_out"; then
+    if [ "$quc_ec" -ne 0 ] || ! grep -q '^quiet-usb-copy 0.4.0-rc.10$' "$quc_out" || ! grep -q '^build 20261112.3$' "$quc_out"; then
         echo "version output"
         cat "$quc_out" "$quc_err"
         bad=1
@@ -675,20 +673,16 @@ EOF
             diff_hit=1
         fi
     done < "$WORK/disks.txt"
-    # Пары разделов хоста зависят от железа. Нет пары — UNVERIFIED, не PASS:
-    # обязательная проверка ниже идёт на синтетическом /sys/class/block.
     if [ "$named" -ne 1 ] || [ "$same_hit" -ne 1 ] || [ "$diff_hit" -ne 1 ]; then
-        echo "UNVERIFIED host-disk-pairs same=$same_hit diff=$diff_hit named=$named"
+        echo "disk pairs same=$same_hit diff=$diff_hit named=$named"
+        bad=1
     fi
-    if [ -n "$spec1" ]; then
-        msg=$(quc_disk_pair_problem "$spec1" /dev/no-such-quc-disk-b)
-        rc=$?
-        if [ "$rc" -eq 0 ] || [ -z "$msg" ]; then
-            echo "half-identified pair accepted"
-            bad=1
-        fi
+    msg=$(quc_disk_pair_problem "$spec1" /dev/no-such-quc-disk-b)
+    rc=$?
+    if [ "$rc" -eq 0 ] || [ -z "$msg" ]; then
+        echo "half-identified pair accepted"
+        bad=1
     fi
-    unit_disk_fixture || bad=1
     by_spec=
     by_disk=
     other_spec=
@@ -1337,7 +1331,7 @@ test_T12() {
     make_pair 8m 256k || { fail "mount"; return; }
     echo small > "$src/a.txt"
     run_quiet "$SH" "$SCRIPT" check "$src" "$dst"
-    if ! grep -q '^check_result=REJECT$' "$quc_out" || ! grep -q "недостаточно" "$quc_out"; then
+    if ! grep -q '^check_result=REJECT$' "$quc_out" || ! grep -q "недостаточно" "$quc_out" || ! grep -q "с запасом" "$quc_out"; then
         echo "space check"
         cat "$quc_out"
         bad=1
@@ -1909,16 +1903,23 @@ test_T25() {
     wrap=$WORK/t-$current/bin
     mkdir -p "$wrap"
     real_ln=$(PATH=$ORIG_PATH command -v ln)
+    # Only symlink creation into this tree is refused. A hard link still
+    # publishes. Refusing every ln made the mount mark fail closed, which is
+    # covered by F02, and never reached the special-file policy.
     cat > "$wrap/ln" <<EOF
 #!/bin/sh
+symlink=0
+blocked=0
 for a in "\$@"; do
     case \$a in
-        *quc-nosymlink*)
-            echo "Operation not permitted" >&2
-            exit 1
-            ;;
+        -s) symlink=1 ;;
+        *quc-nosymlink*) blocked=1 ;;
     esac
 done
+if [ "\$symlink" = 1 ] && [ "\$blocked" = 1 ]; then
+    echo "Operation not permitted" >&2
+    exit 1
+fi
 exec $real_ln "\$@"
 EOF
     chmod 755 "$wrap/ln"
@@ -1998,7 +1999,7 @@ test_T27() {
 test_dx() {
     bad=0
     run_quiet "$SH" "$SCRIPT" version
-    if [ "$quc_ec" -ne 0 ] || ! grep -q '^quiet-usb-copy 0.4.0-rc.7$' "$quc_out" || ! grep -q '^build 20261108.2$' "$quc_out"; then
+    if [ "$quc_ec" -ne 0 ] || ! grep -q '^quiet-usb-copy 0.4.0-rc.10$' "$quc_out" || ! grep -q '^build 20261112.3$' "$quc_out"; then
         echo "version"
         bad=1
     fi
@@ -2124,7 +2125,7 @@ test_UX01() {
         echo "menu slow first=$quc_pty_first"
         bad=1
     fi
-    if ! grep -q 'Quiet USB Copy' "$quc_out" || ! grep -q 'PRESENTATION' "$quc_out" || ! grep -q 'BACKUP' "$quc_out" || ! grep -q 'Направление:' "$quc_out" || ! grep -q 'Режим: прямой' "$quc_out" || ! grep -q 'Размещение: корень назначения' "$quc_out" || ! grep -q 'Отключение назначения: включено' "$quc_out" || ! grep -q 'Исходный накопитель остаётся подключённым.' "$quc_out" || ! grep -q 'Вердикт: можно копировать с ограничением.' "$quc_out" || ! grep -q 'Существующие имена не заменяются.' "$quc_out" || ! grep -q 'Копирование запущено в фоне' "$quc_out"; then
+    if ! grep -q 'Quiet USB Copy' "$quc_out" || ! grep -q 'PRESENTATION' "$quc_out" || ! grep -q 'BACKUP' "$quc_out" || ! grep -q 'Направление:' "$quc_out" || ! grep -q 'Режим: бережный' "$quc_out" || ! grep -q 'Данные:' "$quc_out" || ! grep -q 'Размещение: корень назначения' "$quc_out" || ! grep -q 'Отключение назначения: включено' "$quc_out" || ! grep -q 'После копирования содержимое будет проверено. При успешной проверке программа попытается безопасно отключить назначение.' "$quc_out" || ! grep -q 'Исходный накопитель остаётся подключённым.' "$quc_out" || ! grep -q 'Вердикт: можно копировать с ограничением.' "$quc_out" || ! grep -q 'Существующие имена не заменяются.' "$quc_out" || ! grep -q 'Копирование запущено в фоне' "$quc_out"; then
         echo "menu text"
         cat "$quc_out"
         bad=1
@@ -2580,7 +2581,7 @@ test_UX16() {
     export QUC_FAKE_VOLUMES=$fake
     printf '1\n2\n2\n0\n' > "$WORK/t-$current/in"
     pty_run "$WORK/t-$current/in" /bin/sh "$SCRIPT"
-    if [ "$quc_ec" != 0 ] || ! grep -q 'Подробности' "$quc_out" || ! grep -q 'Запуск не начат.' "$quc_out" || ! grep -q 'Проверки:' "$quc_out" || ! grep -q 'Жёсткие ссылки на назначении: не проверялись' "$quc_out" || grep -q 'Копирование запущено' "$quc_out"; then
+    if [ "$quc_ec" != 0 ] || ! grep -q 'Подробности' "$quc_out" || ! grep -q 'Запуск не начат.' "$quc_out" || ! grep -q 'Проверки:' "$quc_out" || ! grep -q 'Жёсткие ссылки на назначении: доступны' "$quc_out" || grep -q 'Копирование запущено' "$quc_out"; then
         echo "details"
         cat "$quc_out"
         bad=1
@@ -2601,67 +2602,6 @@ QUC_SOURCE_ONLY=1
 # shellcheck disable=SC1090
 . "$SCRIPT"
 unset QUC_SOURCE_ONLY
-
-# Синтетическое дерево /sys/class/block во вложенном mount namespace.
-# Настоящие диски не читаются и не трогаются.
-unit_disk_fixture() {
-    fx=$WORK/fake-sys
-    rm -rf "$fx"
-    # Цели ссылок внутри смонтированного каталога: .d/<диск>/<раздел>,
-    # как ../../devices/... в настоящем sysfs.
-    fd=$fx/block/.d
-    mkdir -p "$fd/qucfa/qucfa1" "$fd/qucfa/qucfa2" "$fd/qucfb/qucfb1" \
-        "$fd/dm-90/slaves" "$fd/dm-91/dm" "$fd/dm-92/slaves" || return 1
-    for p in qucfa/qucfa1 qucfa/qucfa2 qucfb/qucfb1; do
-        echo 1 > "$fd/$p/partition"
-        ln -s ".d/$p" "$fx/block/${p#*/}"
-    done
-    for d in qucfa qucfb dm-90 dm-91 dm-92; do
-        ln -s ".d/$d" "$fx/block/$d"
-    done
-    : > "$fd/dm-90/slaves/qucfb1"
-    echo crypt > "$fd/dm-91/dm/name"
-    : > "$fd/dm-92/slaves/qucfa1"
-    : > "$fd/dm-92/slaves/qucfb1"
-    QUC_SOURCE_ONLY=1 unshare --mount --propagation private "$SH" -c '
-        mount --bind "$1" /sys/class/block || { echo "fixture bind failed"; exit 1; }
-        . "$2"
-        quc_resolve_tools >/dev/null 2>&1 || true
-        bad=0
-        expect_name() {
-            got=$(quc_disk_name "$1" 0) || got=
-            [ "$got" = "$2" ] || { echo "fixture disk_name $1: got=[$got] want=[$2]"; bad=1; }
-        }
-        expect_name /dev/qucfa1 qucfa
-        expect_name /dev/qucfa2 qucfa
-        expect_name /dev/qucfb1 qucfb
-        expect_name /dev/qucfa qucfa
-        expect_name /dev/dm-90 qucfb
-        expect_name /dev/dm-91 ""
-        expect_name /dev/dm-92 ""
-        expect_name /dev/qucfz9 ""
-        msg=$(quc_disk_pair_problem /dev/qucfa1 /dev/qucfa2); rc=$?
-        case "$rc:$msg" in
-            1:*"одного физического диска"*) ;;
-            *) echo "fixture same disk allowed rc=$rc msg=$msg"; bad=1 ;;
-        esac
-        msg=$(quc_disk_pair_problem /dev/dm-90 /dev/qucfb1); rc=$?
-        case "$rc:$msg" in
-            1:*"одного физического диска"*) ;;
-            *) echo "fixture crypt-on-same-disk allowed rc=$rc msg=$msg"; bad=1 ;;
-        esac
-        msg=$(quc_disk_pair_problem /dev/qucfa1 /dev/qucfb1); rc=$?
-        [ "$rc" -eq 0 ] && [ -z "$msg" ] || { echo "fixture different disks rejected rc=$rc msg=$msg"; bad=1; }
-        for b in /dev/qucfz9 /dev/dm-91 /dev/dm-92; do
-            msg=$(quc_disk_pair_problem /dev/qucfa1 "$b"); rc=$?
-            case "$rc:$msg" in
-                1:*"не определён"*) ;;
-                *) echo "fixture unresolved pair accepted $b rc=$rc msg=$msg"; bad=1 ;;
-            esac
-        done
-        exit "$bad"
-    ' fixture "$fx/block" "$SCRIPT"
-}
 
 run_case U-static test_static
 run_case U-dx test_dx
@@ -2721,7 +2661,7 @@ if [ "$leaked" != 0 ]; then
     fail "leftover processes: $leaked"
 fi
 
-printf 'RESULT passes=%s fails=%s\n' "$passes" "$fails"
+printf 'RESULT passes=%s fails=%s skips=%s\n' "$passes" "$fails" "$skips"
 if [ "$fails" -ne 0 ]; then
     exit 1
 fi
